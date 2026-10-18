@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Resource Monitor",
+    "description": "Live CPU and memory graphs plus token usage statistics in the bottom-left corner of the window."
+  }
+}

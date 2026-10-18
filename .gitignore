@@ -1,0 +1,5 @@
+# Internal development contract (excluded from the public repository)
+CONTRACT.md
+node_modules/
+.DS_Store
+*.log

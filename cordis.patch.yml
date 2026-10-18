@@ -1,0 +1,3 @@
+- insert:
+    - id: dsh-resmon
+      name: '@local/dsh-resmon'
