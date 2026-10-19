@@ -63,6 +63,21 @@ dsh plugin install ./dsh-resmon
 | 小鲸鱼账本 | 是否读取账本、自定义账本路径(默认 `~/.dsh/.dshw-usage.json`) |
 | 采样节奏 | 网络/GPU 采样间隔秒、磁盘采样间隔秒、DSH 占用重算间隔分钟 |
 
+## 外部程序接口(可选)
+
+在设置页「外部程序接口」分组启用后,插件在 `127.0.0.1:<端口>`(默认 57123)提供只读数据与面板控制通道,供 exe / Python / PowerShell / Node / C# 等本机程序调用:
+
+| 端点 | 说明 |
+|---|---|
+| `GET /v1/health` | 健康检查 |
+| `GET /v1/stats` | 资源采样快照(CPU/内存/磁盘/网络/GPU/DSH 占用) |
+| `GET /v1/usage?sessionId=` | Token 与费用统计 |
+| `GET /v1/panel` | 当前面板参数命令 |
+| `POST /v1/panel` | 下发面板参数(增删监控项/折叠/口径/Token 视图) |
+| `GET /v1/spec` | 接口规范文档 |
+
+服务仅绑定回环地址,不暴露任何凭据,不提供写配置或执行命令能力。开启时自动生成中文接口规范文件 `$DSH_HOME/dsh-resmon-external-api.md`(含 curl / PowerShell / Python / Node.js / C# 调用示例),也可在设置页一键重新生成。
+
 ## 数据口径说明(重要)
 
 | 项目 | 口径 |
