@@ -13,6 +13,7 @@
 import os from 'node:os';
 import { readFileSync } from 'node:fs';
 import { mkdir, readdir, readFile, rename, stat, statfs, unlink, writeFile } from 'node:fs/promises';
+import { createServer } from 'node:http';
 import { basename, dirname, join, resolve } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -134,6 +135,22 @@ const OFFICIAL_BALANCE_INTERVAL_MS = 60000; // snapshot cadence (source re-probe
 /** Runtime-editable JSON config file: <home>/.dsh-resmon-config.json.
  *  Priority: file > schemastery Config > built-in defaults. */
 const CONFIG_FILENAME = '.dsh-resmon-config.json';
+
+/** External loopback HTTP API (CONTRACT.md §11): panel-command whitelists,
+ *  default port and the generated spec file name. */
+const PANEL_ITEM_WHITELIST = ['cpu', 'mem', 'disk', 'net', 'gpu', 'tokens', 'cost', 'dshsize'];
+const PANEL_SCOPE_VALUES = ['machine', 'dsh'];
+const PANEL_METRIC_VALUES = ['turn', 'session', 'today', 'cumulative'];
+const EXTERNAL_DEFAULT_PORT = 57123;
+const EXTERNAL_SPEC_FILENAME = 'dsh-resmon-external-api.md';
+
+/** Plugin version for the external API/spec; read from the neighbouring
+ *  package.json when present, else the fallback constant. */
+let PLUGIN_VERSION = '1.0.0';
+try {
+  const pkg = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
+  if (pkg && typeof pkg.version === 'string') PLUGIN_VERSION = pkg.version;
+} catch { /* keep the fallback version */ }
 
 function round2(value) {
   return Math.round(value * 100) / 100;
@@ -483,6 +500,10 @@ export const Config = z.object({
     diskSeconds: z.number().min(2).max(120).default(5).description('磁盘采样间隔(秒)'),
     dshsizeMinutes: z.number().min(1).max(120).default(5).description('DSH 占用重算间隔(分钟)'),
   }).description('采样节奏').default({}),
+  external: z.object({
+    enabled: z.boolean().default(false).description('启用外部程序接口(仅 127.0.0.1)'),
+    port: z.number().min(1024).max(65535).default(57123).description('外部接口监听端口'),
+  }).description('外部程序接口').default({}),
 });
 
 export function apply(ctx, config = {}) {
@@ -517,6 +538,7 @@ export function apply(ctx, config = {}) {
       official: { mode: 'auto', pollSeconds: 60 },
       whale: { enabled: true, path: '' },
       sampling: { netGpuSeconds: 2, diskSeconds: 5, dshsizeMinutes: 5 },
+      external: { enabled: false, port: EXTERNAL_DEFAULT_PORT },
     };
   }
 
@@ -607,6 +629,19 @@ export function apply(ctx, config = {}) {
         merged.sampling[key] = r.value;
       }
     }
+    if (patch.external !== undefined) {
+      if (!patch.external || typeof patch.external !== 'object' || Array.isArray(patch.external)) return { ok: false, error: 'external must be an object' };
+      const e = patch.external;
+      if (e.enabled !== undefined) {
+        if (typeof e.enabled !== 'boolean') return { ok: false, error: 'external.enabled must be a boolean' };
+        merged.external.enabled = e.enabled;
+      }
+      if (e.port !== undefined) {
+        const r = numIn(e.port, 1024, 65535, 'external.port');
+        if (!r.ok) return r;
+        merged.external.port = r.value;
+      }
+    }
     return { ok: true, value: merged };
   }
 
@@ -621,6 +656,13 @@ export function apply(ctx, config = {}) {
   let netGpuEveryTicks = 2;
   let diskEveryTicks = 5;
   let dshsizeEveryTicks = 300;
+  let externalEnabled = false;
+  let externalPort = EXTERNAL_DEFAULT_PORT;
+  let externalServer = null;
+  let externalListeningPort = null;
+  const externalState = { running: false, error: null };
+  // External → Client panel command channel (GET /v1/panel + /api/dsh-resmon/panel).
+  const panelCommand = { revision: 0, command: null };
 
   /** (Re)start the official-balance polling interval with the current
    *  pollSeconds (a config change rebuilds the timer). */
@@ -672,6 +714,16 @@ export function apply(ctx, config = {}) {
     diskEveryTicks = Number.isFinite(d) && d >= 2 ? Math.max(2, Math.round(d)) : 5;
     const m = Number(s.dshsizeMinutes);
     dshsizeEveryTicks = Number.isFinite(m) && m >= 1 ? Math.max(60, Math.round(m * 60)) : 300;
+    // External loopback API: start / restart / stop according to config.
+    externalEnabled = effectiveCfg.external.enabled === true;
+    const ep = Number(effectiveCfg.external.port);
+    externalPort = Number.isFinite(ep) && ep >= 1024 && ep <= 65535 ? Math.round(ep) : EXTERNAL_DEFAULT_PORT;
+    if (externalEnabled && (externalServer === null || externalListeningPort !== externalPort)) {
+      stopExternalServer();
+      startExternalServer();
+    } else if (!externalEnabled) {
+      stopExternalServer();
+    }
     startOfficialTimer();
   }
 
@@ -699,6 +751,283 @@ export function apply(ctx, config = {}) {
     effectiveCfg = merged.value;
     applyEffectiveConfig();
     return cloneConfig(effectiveCfg);
+  }
+
+  /* ==================== external loopback HTTP API ==================== */
+
+  function externalResponse(res, status, body, contentType) {
+    try {
+      res.writeHead(status, {
+        'content-type': contentType ?? 'application/json; charset=utf-8',
+        'cache-control': 'no-store',
+      });
+      res.end(typeof body === 'string' ? body : JSON.stringify(body));
+    } catch { /* socket already gone */ }
+  }
+
+  function stopExternalServer() {
+    if (externalServer === null) return;
+    const server = externalServer;
+    externalServer = null;
+    externalListeningPort = null;
+    externalState.running = false;
+    try { server.close(); } catch { /* never listened */ }
+  }
+
+  function handleExternalRequest(req, res) {
+    let url;
+    try { url = new URL(req.url ?? '/', 'http://127.0.0.1'); } catch { url = null; }
+    if (!url) { externalResponse(res, 400, { ok: false, error: 'bad url' }); return; }
+    const method = req.method ?? 'GET';
+    const path = url.pathname;
+    const routeHandlers = {
+      '/': {
+        GET: () => externalResponse(res, 200, {
+          ok: true,
+          service: 'dsh-resmon',
+          version: PLUGIN_VERSION,
+          endpoints: ['/v1/health', '/v1/stats', '/v1/usage', '/v1/panel', '/v1/spec'],
+          spec: '/v1/spec',
+        }),
+      },
+      '/v1/health': {
+        GET: () => externalResponse(res, 200, { ok: true, pid: process.pid, uptimeSeconds: Math.floor(process.uptime()) }),
+      },
+      '/v1/stats': {
+        GET: () => externalResponse(res, 200, { ok: true, value: statsPayload() }),
+      },
+      '/v1/usage': {
+        GET: () => {
+          const sessionId = url.searchParams.get('sessionId') ?? undefined;
+          externalResponse(res, 200, { ok: true, value: usagePayload(sessionId) });
+        },
+      },
+      '/v1/panel': {
+        GET: () => externalResponse(res, 200, { ok: true, value: { ...panelCommand } }),
+        POST: () => {
+          let body = '';
+          req.on('data', (chunk) => {
+            body += chunk;
+            if (body.length > 65536) req.destroy();
+          });
+          req.on('error', () => { try { res.destroy(); } catch { /* ignore */ } });
+          req.on('end', () => {
+            let parsed = null;
+            try { parsed = JSON.parse(body || '{}'); } catch { parsed = null; }
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+              externalResponse(res, 400, { ok: false, error: 'body must be a JSON object' });
+              return;
+            }
+            const command = {};
+            if (parsed.items !== undefined) {
+              if (!Array.isArray(parsed.items) || parsed.items.some((item) => typeof item !== 'string' || !PANEL_ITEM_WHITELIST.includes(item))) {
+                externalResponse(res, 400, { ok: false, error: `items must be an array containing only: ${PANEL_ITEM_WHITELIST.join(', ')}` });
+                return;
+              }
+              command.items = [...new Set(parsed.items)];
+            }
+            if (parsed.collapsed !== undefined) {
+              if (typeof parsed.collapsed !== 'boolean') {
+                externalResponse(res, 400, { ok: false, error: 'collapsed must be a boolean' });
+                return;
+              }
+              command.collapsed = parsed.collapsed;
+            }
+            if (parsed.scope !== undefined) {
+              if (!PANEL_SCOPE_VALUES.includes(parsed.scope)) {
+                externalResponse(res, 400, { ok: false, error: `scope must be one of: ${PANEL_SCOPE_VALUES.join(', ')}` });
+                return;
+              }
+              command.scope = parsed.scope;
+            }
+            if (parsed.metric !== undefined) {
+              if (!PANEL_METRIC_VALUES.includes(parsed.metric)) {
+                externalResponse(res, 400, { ok: false, error: `metric must be one of: ${PANEL_METRIC_VALUES.join(', ')}` });
+                return;
+              }
+              command.metric = parsed.metric;
+            }
+            panelCommand.revision = Date.now();
+            panelCommand.command = command;
+            externalResponse(res, 200, { ok: true, value: { ...panelCommand } });
+          });
+        },
+      },
+      '/v1/spec': {
+        GET: async () => {
+          try {
+            const spec = buildExternalSpec();
+            externalResponse(res, 200, spec, 'text/markdown; charset=utf-8');
+          } catch (error) {
+            externalResponse(res, 500, { ok: false, error: String(error?.message ?? error) });
+          }
+        },
+      },
+    };
+    const handlers = routeHandlers[path];
+    if (!handlers) { externalResponse(res, 404, { ok: false, error: 'not found' }); return; }
+    const handler = handlers[method];
+    if (!handler) {
+      res.writeHead(405, { allow: Object.keys(handlers).join(', '), 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+      res.end(JSON.stringify({ ok: false, error: 'method not allowed' }));
+      return;
+    }
+    handler();
+  }
+
+  function startExternalServer() {
+    if (!externalEnabled || externalServer !== null) return;
+    externalState.error = null;
+    const server = createServer((req, res) => {
+      try {
+        handleExternalRequest(req, res);
+      } catch (error) {
+        externalResponse(res, 500, { ok: false, error: String(error?.message ?? error) });
+      }
+    });
+    server.on('error', (error) => {
+      externalState.error = String(error?.message ?? error);
+      externalState.running = false;
+      logger.warn(`dsh-resmon: external HTTP server error: ${externalState.error}`);
+    });
+    externalServer = server;
+    server.listen(externalPort, '127.0.0.1', () => {
+      externalListeningPort = externalPort;
+      externalState.running = true;
+      externalState.error = null;
+      logger.debug?.(`dsh-resmon: external HTTP server listening on 127.0.0.1:${externalPort}`);
+      writeExternalSpec(buildExternalSpec())
+        .catch((error) => logger.warn(`dsh-resmon: external spec generation failed: ${String(error?.message ?? error)}`));
+    });
+  }
+
+  /** Chinese Markdown spec for the external API (endpoint table, parameters,
+   *  response examples, curl / PowerShell / Python / Node.js / C# snippets,
+   *  version and generation time). */
+  function buildExternalSpec() {
+    const base = `http://127.0.0.1:${externalPort}`;
+    const items = PANEL_ITEM_WHITELIST.join('、');
+    const generatedAt = new Date().toISOString();
+    return `# dsh-resmon 外部程序接口规范
+
+资源监控插件(@local/dsh-resmon)为外部本机程序提供的回环 HTTP 接口。
+服务仅在配置 external.enabled 为真时监听 **127.0.0.1:${externalPort}**,不对外网开放;不提供任何凭据、密钥或写配置/执行命令能力(仅读数据与面板参数控制)。
+
+- 所有响应带 \`Cache-Control: no-store\`;JSON 响应为 \`application/json; charset=utf-8\`,规范文档为 \`text/markdown; charset=utf-8\`。
+- 版本:${PLUGIN_VERSION};生成时间:${generatedAt}(北京时间 ${new Date(Date.now() + 8 * 3600 * 1000).toISOString().replace('T', ' ').slice(0, 19)})。
+
+## 端点
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | / | 服务信息与端点列表 |
+| GET | /v1/health | 健康检查(pid、uptimeSeconds) |
+| GET | /v1/stats | 当前资源采样快照(CPU/内存/磁盘/网络/GPU/DSH 占用等,与面板同结构) |
+| GET | /v1/usage?sessionId=... | Token 与费用统计(可选 sessionId) |
+| GET | /v1/panel | 当前面板参数命令 |
+| POST | /v1/panel | 下发面板参数命令(增删监控项/折叠/口径/Token 视图) |
+| GET | /v1/spec | 本规范文档(Markdown) |
+
+未知路径返回 404、方法不符返回 405(JSON)。
+
+## 响应示例
+
+### GET /v1/health
+
+\`\`\`json
+{ "ok": true, "pid": 1234, "uptimeSeconds": 3600 }
+\`\`\`
+
+### GET /v1/stats
+
+\`\`\`json
+{ "ok": true, "value": { "now": 1730000000000, "cpu": 12.3, "mem": { "percent": 41.2 }, "disk": [ { "drive": "C:", "percent": 41.2, "activePercent": 12.5 } ], "net": { "available": true, "downBps": 0, "upBps": 0 }, "gpu": { "available": true, "util": 34.5, "memUsed": 0, "memTotal": null }, "system": { "osVersion": "Win11 26H2 26300.9711" } } }
+\`\`\`
+
+### POST /v1/panel
+
+请求体(全部可选):
+
+\`\`\`json
+{
+  "items": ["cpu", "mem", "tokens"],   // 白名单:${items}
+  "collapsed": false,
+  "scope": "machine",                  // machine | dsh
+  "metric": "today"                    // turn | session | today | cumulative
+}
+\`\`\`
+
+响应:
+
+\`\`\`json
+{ "ok": true, "value": { "revision": 1792347556758, "command": { "items": ["cpu", "mem", "tokens"], "collapsed": false } } }
+\`\`\`
+
+非法参数返回 HTTP 400:\`{ "ok": false, "error": "items must be an array containing only: ..." }\`。
+
+## 调用示例
+
+### curl
+
+\`\`\`bash
+curl -s ${base}/v1/health
+curl -s "${base}/v1/usage?sessionId=<会话id>"
+curl -s -X POST ${base}/v1/panel -H "Content-Type: application/json" -d '{"items":["cpu","mem","tokens"],"collapsed":false}'
+\`\`\`
+
+### PowerShell
+
+\`\`\`powershell
+Invoke-RestMethod -Uri '${base}/v1/stats'
+Invoke-RestMethod -Method Post -Uri '${base}/v1/panel' -ContentType 'application/json' -Body '{"items":["cpu","mem","tokens"]}'
+\`\`\`
+
+### Python
+
+\`\`\`python
+import requests
+print(requests.get('${base}/v1/health').json())
+print(requests.post('${base}/v1/panel', json={"items": ["cpu", "mem"], "collapsed": False}).json())
+\`\`\`
+
+### Node.js
+
+\`\`\`js
+const res = await fetch('${base}/v1/stats');
+console.log(await res.json());
+await fetch('${base}/v1/panel', {
+  method: 'POST',
+  headers: { 'content-type': 'application/json' },
+  body: JSON.stringify({ items: ['cpu', 'gpu'] }),
+});
+\`\`\`
+
+### C#
+
+\`\`\`csharp
+using var client = new HttpClient { BaseAddress = new Uri("${base}") };
+var stats = await client.GetStringAsync("/v1/stats");
+await client.PostAsync("/v1/panel", new StringContent(
+    "{\\"items\\":[\\"cpu\\",\\"gpu\\"]}", System.Text.Encoding.UTF8, "application/json"));
+\`\`\`
+`;
+  }
+
+  /** Write the spec into <home>/dsh-resmon-external-api.md; returns path. */
+  async function writeExternalSpec(spec) {
+    const home = homeDir();
+    if (!home) throw new Error('cannot resolve the home directory');
+    const target = join(home, EXTERNAL_SPEC_FILENAME);
+    await mkdir(dirname(target), { recursive: true });
+    await writeFile(target, spec, 'utf8');
+    return target;
+  }
+
+  /** Build + persist the spec, returning { path, content } for the routes. */
+  async function ensureExternalSpec() {
+    const content = buildExternalSpec();
+    const path = await writeExternalSpec(content);
+    return { path, content };
   }
 
   /* ---- boot: schemastery Config over defaults, then the JSON file wins ---- */
@@ -2057,6 +2386,7 @@ export function apply(ctx, config = {}) {
       clearInterval(persistTimer);
       clearInterval(backfillTimer);
       if (officialTimer !== null) clearInterval(officialTimer);
+      stopExternalServer();
       if (domain) persist().catch(() => {});
     });
   })().catch((error) => logger.warn(`dsh-resmon: boot folding failed: ${String(error?.message ?? error)}`));
@@ -2119,6 +2449,12 @@ export function apply(ctx, config = {}) {
         app: dshsizeState.app,
         home: dshsizeState.home,
         total: dshsizeState.total,
+      },
+      external: {
+        enabled: externalEnabled,
+        port: externalPort,
+        running: externalState.running,
+        error: externalState.error,
       },
     };
   }
@@ -2269,6 +2605,35 @@ export function apply(ctx, config = {}) {
         return Response.json({ ok: true, value });
       } catch (error) {
         return Response.json({ ok: false, error: { message: String(error?.message ?? error) } }, { status: 400 });
+      }
+    },
+  }));
+
+  // Panel command channel: the Client polls this to apply external commands.
+  ctx.effect(() => ctx.connection.fetch.register({
+    path: '/api/dsh-resmon/panel',
+    methods: ['GET'],
+    requestBody: 'buffered',
+    fetch: async () => {
+      try {
+        return Response.json({ ok: true, value: { revision: panelCommand.revision, command: panelCommand.command } });
+      } catch (error) {
+        return Response.json({ ok: false, error: String(error?.message ?? error) }, { status: 500 });
+      }
+    },
+  }));
+
+  // Spec generation: POST regenerates + rewrites the file; GET returns the
+  // same { path, content } shape (settings page display).
+  ctx.effect(() => ctx.connection.fetch.register({
+    path: '/api/dsh-resmon/spec',
+    methods: ['GET', 'POST'],
+    requestBody: 'buffered',
+    fetch: async () => {
+      try {
+        return Response.json({ ok: true, value: await ensureExternalSpec() });
+      } catch (error) {
+        return Response.json({ ok: false, error: String(error?.message ?? error) }, { status: 500 });
       }
     },
   }));

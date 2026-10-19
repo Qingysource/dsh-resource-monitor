@@ -305,6 +305,15 @@ window.__ModuleLoader__.load({
       const rootRef = useRef(null);
       const posRef = useRef(pos);
       posRef.current = pos;
+      const lastPanelRevRef = useRef(null);
+      if (lastPanelRevRef.current === null) {
+        try {
+          const n = Number(localStorage.getItem('dsh-resmon.panelRev'));
+          lastPanelRevRef.current = isFinite(n) && n > 0 ? n : 0;
+        } catch {
+          lastPanelRevRef.current = 0;
+        }
+      }
 
       useEffect(() => {
         let alive = true;
@@ -420,6 +429,58 @@ window.__ModuleLoader__.load({
       const removeItem = (id) => {
         persistItems(items.filter((itemId) => itemId !== id));
       };
+
+      const applyCollapsed = (value) => {
+        setMenuOpen(false);
+        setCollapsed(value === true);
+        try {
+          localStorage.setItem('dsh-resmon.collapsed', value === true ? '1' : '0');
+        } catch { /* storage unavailable */ }
+      };
+
+      /**
+       * Applies an external panel command (from /api/dsh-resmon/panel).
+       * Only valid fields are applied, so the UI changes exactly as if the
+       * user had clicked the corresponding controls.
+       */
+      const applyPanelCommand = (command) => {
+        if (!command || typeof command !== 'object') return;
+        if (Array.isArray(command.items)) {
+          const known = new Set(ITEM_DEFS.map((def) => def.id));
+          const filtered = [...new Set(command.items.filter((id) => known.has(id)))];
+          persistItems(filtered);
+        }
+        if (typeof command.collapsed === 'boolean') applyCollapsed(command.collapsed);
+        if (command.scope === 'machine' || command.scope === 'dsh') pickScope(command.scope);
+        if (command.metric === 'turn' || command.metric === 'session' || command.metric === 'today' || command.metric === 'cumulative') pickMetric(command.metric);
+      };
+
+      // Poll the external panel-command channel and apply newer revisions.
+      useEffect(() => {
+        let alive = true;
+        const controller = new AbortController();
+        const pollPanel = async () => {
+          if (!alive) return;
+          try {
+            const value = await hostFetch('/api/dsh-resmon/panel', undefined, controller.signal);
+            const revision = value && value.revision;
+            if (typeof revision === 'number' && revision > lastPanelRevRef.current) {
+              applyPanelCommand(value.command);
+              lastPanelRevRef.current = revision;
+              try {
+                localStorage.setItem('dsh-resmon.panelRev', String(revision));
+              } catch { /* storage unavailable */ }
+            }
+          } catch { /* route not ready yet or host restarting */ }
+        };
+        pollPanel();
+        const id = setInterval(pollPanel, 2000);
+        return () => {
+          alive = false;
+          controller.abort();
+          clearInterval(id);
+        };
+      }, []);
 
       const isZh = String(getLocale() || '').toLowerCase().startsWith('zh');
       const cpu = stats ? stats.cpu : null;
@@ -836,6 +897,7 @@ window.__ModuleLoader__.load({
       const pm = p.models || {};
       const o = v.official || {};
       const w = v.whale || {};
+      const x = v.external || {};
       const s = v.sampling || {};
       return {
         pricing: {
@@ -853,6 +915,10 @@ window.__ModuleLoader__.load({
           enabled: w.enabled === true,
           path: typeof w.path === 'string' ? w.path : '',
         },
+        external: {
+          enabled: x.enabled === true,
+          port: x.port != null ? String(x.port) : '',
+        },
         sampling: {
           netGpuSeconds: s.netGpuSeconds != null ? String(s.netGpuSeconds) : '',
           diskSeconds: s.diskSeconds != null ? String(s.diskSeconds) : '',
@@ -868,6 +934,7 @@ window.__ModuleLoader__.load({
       const [draft, setDraft] = useState(null);
       const [busy, setBusy] = useState(false);
       const [notice, setNotice] = useState(null); // { tone: 'ok'|'err', text }
+      const [specNotice, setSpecNotice] = useState(null); // { tone: 'ok'|'err', text }
 
       useEffect(() => {
         let alive = true;
@@ -908,6 +975,7 @@ window.__ModuleLoader__.load({
       const patchModels = (key, value) => setDraft((current) => ({ ...current, pricing: { ...current.pricing, models: { ...current.pricing.models, [key]: value } } }));
       const patchOfficial = (key, value) => setDraft((current) => ({ ...current, official: { ...current.official, [key]: value } }));
       const patchWhale = (key, value) => setDraft((current) => ({ ...current, whale: { ...current.whale, [key]: value } }));
+      const patchExternal = (key, value) => setDraft((current) => ({ ...current, external: { ...current.external, [key]: value } }));
       const patchSampling = (key, value) => setDraft((current) => ({ ...current, sampling: { ...current.sampling, [key]: value } }));
 
       const buildPayload = () => {
@@ -922,6 +990,8 @@ window.__ModuleLoader__.load({
         if (d.pricing.models.overrides !== '') pricing.models.overrides = d.pricing.models.overrides;
         const official = { mode: d.official.mode };
         if (number(d.official.pollSeconds) != null) official.pollSeconds = number(d.official.pollSeconds);
+        const external = { enabled: d.external.enabled === true };
+        if (number(d.external.port) != null) external.port = number(d.external.port);
         const sampling = {};
         if (number(d.sampling.netGpuSeconds) != null) sampling.netGpuSeconds = number(d.sampling.netGpuSeconds);
         if (number(d.sampling.diskSeconds) != null) sampling.diskSeconds = number(d.sampling.diskSeconds);
@@ -930,6 +1000,7 @@ window.__ModuleLoader__.load({
           pricing,
           official,
           whale: { enabled: d.whale.enabled === true, path: d.whale.path },
+          external,
           sampling,
         };
       };
@@ -952,8 +1023,23 @@ window.__ModuleLoader__.load({
         pricing: { offPeakRatio: 0.5, models: { overrides: '{}' } },
         official: { mode: 'auto', pollSeconds: 60 },
         whale: { enabled: true, path: '' },
+        external: { enabled: false, port: 57123 },
         sampling: { netGpuSeconds: 2, diskSeconds: 5, dshsizeMinutes: 5 },
       }, 'reset');
+
+      const onGenSpec = async () => {
+        setBusy(true);
+        setSpecNotice(null);
+        try {
+          const value = await hostFetch('/api/dsh-resmon/spec', undefined, undefined, 'POST');
+          const path = value && value.path ? value.path : '';
+          setSpecNotice({ tone: 'ok', text: `${t('sGenSpecDone')}: ${path}` });
+        } catch (error) {
+          setSpecNotice({ tone: 'err', text: `${t('sGenSpecFailed')}: ${error instanceof Error ? error.message : String(error)}` });
+        } finally {
+          setBusy(false);
+        }
+      };
 
       const field = (labelKey, control) => h('label', { className: 'drs-field' },
         h('span', { className: 'drs-field-label' }, t(labelKey)),
@@ -1014,6 +1100,22 @@ window.__ModuleLoader__.load({
             placeholder: t('sWhalePathHint'),
             onChange: (event) => patchWhale('path', event.target.value),
           }))),
+        h('div', { className: 'drs-group' },
+          h('div', { className: 'drs-group-title' }, t('sExternal')),
+          field('sExternalEnabled', h('input', {
+            type: 'checkbox',
+            checked: d.external.enabled,
+            onChange: (event) => patchExternal('enabled', event.target.checked),
+          })),
+          field('sExternalPort', h('input', {
+            type: 'number', className: 'drs-input', min: 1024, max: 65535,
+            value: d.external.port,
+            onChange: (event) => patchExternal('port', event.target.value),
+          })),
+          h('div', { className: 'drs-hint' }, t('sExternalHint')),
+          h('div', { className: 'drs-spec-row' },
+            h('button', { type: 'button', className: 'drs-btn', disabled: busy, onClick: onGenSpec }, t('sGenSpec')),
+            specNotice ? h('span', { className: specNotice.tone === 'ok' ? 'drs-notice drs-notice-ok' : 'drs-notice drs-notice-err' }, specNotice.text) : null)),
         h('div', { className: 'drs-group' },
           h('div', { className: 'drs-group-title' }, t('sSampling')),
           field('sNetGpu', h('input', {
@@ -1105,6 +1207,17 @@ window.__ModuleLoader__.load({
       }
       .drs-input-wide {
         width: 280px;
+      }
+      .drs-hint {
+        color: var(--dsw-alias-label-secondary);
+        font-size: 11px;
+        margin-top: 6px;
+      }
+      .drs-spec-row {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin-top: 8px;
       }
       .drs-textarea {
         box-sizing: border-box;
@@ -1544,6 +1657,13 @@ window.__ModuleLoader__.load({
             sLoadFailed: 'Failed to load config',
             sSaveFailed: 'Save failed',
             sLoading: 'Loading…',
+            sExternal: 'External API',
+            sExternalEnabled: 'Enabled',
+            sExternalPort: 'Port',
+            sExternalHint: 'Loopback only for local programs',
+            sGenSpec: 'Generate API spec',
+            sGenSpecDone: 'API spec generated',
+            sGenSpecFailed: 'Generation failed',
           },
           zh: {
             title: '资源监控',
@@ -1644,6 +1764,13 @@ window.__ModuleLoader__.load({
             sLoadFailed: '加载配置失败',
             sSaveFailed: '保存失败',
             sLoading: '加载中…',
+            sExternal: '外部程序接口',
+            sExternalEnabled: '启用',
+            sExternalPort: '监听端口',
+            sExternalHint: '仅监听 127.0.0.1,供本机程序调用',
+            sGenSpec: '生成接口规范文件',
+            sGenSpecDone: '规范文件已生成',
+            sGenSpecFailed: '生成失败',
           },
         };
         ctx.locale.register('dsh-resmon', 'en', dicts.en);
