@@ -14,6 +14,7 @@ import os from 'node:os';
 import { readFileSync } from 'node:fs';
 import { mkdir, readdir, readFile, rename, stat, statfs, unlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
+import { createServer as createNetServer } from 'node:net';
 import { basename, dirname, join, resolve } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -143,6 +144,7 @@ const PANEL_SCOPE_VALUES = ['machine', 'dsh'];
 const PANEL_METRIC_VALUES = ['turn', 'session', 'today', 'cumulative'];
 const EXTERNAL_DEFAULT_PORT = 57123;
 const EXTERNAL_SPEC_FILENAME = 'dsh-resmon-external-api.md';
+const EXTERNAL_PIPE_NAME = '\\\\.\\pipe\\dsh-resmon';
 
 /** Plugin version for the external API/spec; read from the neighbouring
  *  package.json when present, else the fallback constant. */
@@ -663,6 +665,9 @@ export function apply(ctx, config = {}) {
   const externalState = { running: false, error: null };
   // External → Client panel command channel (GET /v1/panel + /api/dsh-resmon/panel).
   const panelCommand = { revision: 0, command: null };
+  // Windows named pipe (CONTRACT.md §12): same lifecycle as the HTTP server.
+  let pipeServer = null;
+  const pipeConnections = new Set();
 
   /** (Re)start the official-balance polling interval with the current
    *  pollSeconds (a config change rebuilds the timer). */
@@ -718,11 +723,15 @@ export function apply(ctx, config = {}) {
     externalEnabled = effectiveCfg.external.enabled === true;
     const ep = Number(effectiveCfg.external.port);
     externalPort = Number.isFinite(ep) && ep >= 1024 && ep <= 65535 ? Math.round(ep) : EXTERNAL_DEFAULT_PORT;
-    if (externalEnabled && (externalServer === null || externalListeningPort !== externalPort)) {
+    if (externalEnabled) {
+      if (externalServer === null || externalListeningPort !== externalPort) {
+        stopExternalServer();
+        startExternalServer();
+      }
+      startPipeServer(); // no-op when already running or on non-win32
+    } else {
       stopExternalServer();
-      startExternalServer();
-    } else if (!externalEnabled) {
-      stopExternalServer();
+      stopPipeServer();
     }
     startOfficialTimer();
   }
@@ -774,6 +783,39 @@ export function apply(ctx, config = {}) {
     try { server.close(); } catch { /* never listened */ }
   }
 
+  /** Shared panel-command validation (HTTP POST /v1/panel and the named
+   *  pipe use exactly the same rules): items ⊆ 8-item whitelist (deduped),
+   *  collapsed boolean, scope machine|dsh, metric turn|session|today|cumulative. */
+  function validatePanelCommand(parsed) {
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { ok: false, error: 'body must be a JSON object' };
+    const command = {};
+    if (parsed.items !== undefined) {
+      if (!Array.isArray(parsed.items) || parsed.items.some((item) => typeof item !== 'string' || !PANEL_ITEM_WHITELIST.includes(item))) {
+        return { ok: false, error: `items must be an array containing only: ${PANEL_ITEM_WHITELIST.join(', ')}` };
+      }
+      command.items = [...new Set(parsed.items)];
+    }
+    if (parsed.collapsed !== undefined) {
+      if (typeof parsed.collapsed !== 'boolean') return { ok: false, error: 'collapsed must be a boolean' };
+      command.collapsed = parsed.collapsed;
+    }
+    if (parsed.scope !== undefined) {
+      if (!PANEL_SCOPE_VALUES.includes(parsed.scope)) return { ok: false, error: `scope must be one of: ${PANEL_SCOPE_VALUES.join(', ')}` };
+      command.scope = parsed.scope;
+    }
+    if (parsed.metric !== undefined) {
+      if (!PANEL_METRIC_VALUES.includes(parsed.metric)) return { ok: false, error: `metric must be one of: ${PANEL_METRIC_VALUES.join(', ')}` };
+      command.metric = parsed.metric;
+    }
+    return { ok: true, command };
+  }
+
+  function applyPanelCommand(command) {
+    panelCommand.revision = Date.now();
+    panelCommand.command = command;
+    return { ...panelCommand };
+  }
+
   function handleExternalRequest(req, res) {
     let url;
     try { url = new URL(req.url ?? '/', 'http://127.0.0.1'); } catch { url = null; }
@@ -786,7 +828,7 @@ export function apply(ctx, config = {}) {
           ok: true,
           service: 'dsh-resmon',
           version: PLUGIN_VERSION,
-          endpoints: ['/v1/health', '/v1/stats', '/v1/usage', '/v1/panel', '/v1/spec'],
+          endpoints: ['/v1/health', '/v1/stats', '/v1/usage', '/v1/panel', '/v1/stream', '/v1/spec'],
           spec: '/v1/spec',
         }),
       },
@@ -814,42 +856,46 @@ export function apply(ctx, config = {}) {
           req.on('end', () => {
             let parsed = null;
             try { parsed = JSON.parse(body || '{}'); } catch { parsed = null; }
-            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-              externalResponse(res, 400, { ok: false, error: 'body must be a JSON object' });
+            const result = validatePanelCommand(parsed);
+            if (!result.ok) {
+              externalResponse(res, 400, { ok: false, error: result.error });
               return;
             }
-            const command = {};
-            if (parsed.items !== undefined) {
-              if (!Array.isArray(parsed.items) || parsed.items.some((item) => typeof item !== 'string' || !PANEL_ITEM_WHITELIST.includes(item))) {
-                externalResponse(res, 400, { ok: false, error: `items must be an array containing only: ${PANEL_ITEM_WHITELIST.join(', ')}` });
-                return;
-              }
-              command.items = [...new Set(parsed.items)];
+            externalResponse(res, 200, { ok: true, value: applyPanelCommand(result.command) });
+          });
+        },
+      },
+      '/v1/stream': {
+        GET: () => {
+          const parsedInterval = Number(url.searchParams.get('interval'));
+          const intervalMs = Number.isFinite(parsedInterval) && parsedInterval >= 250 && parsedInterval <= 10000
+            ? Math.round(parsedInterval) : 1000;
+          try {
+            res.writeHead(200, {
+              'content-type': 'application/x-ndjson; charset=utf-8',
+              'cache-control': 'no-store',
+              'connection': 'keep-alive',
+            });
+          } catch { return; }
+          let timer = null;
+          const writeLine = () => {
+            try {
+              res.write(`${JSON.stringify({ type: 'stats', ts: Date.now(), value: statsPayload() })}\n`);
+            } catch {
+              if (timer !== null) clearInterval(timer);
+              timer = null;
+              try { res.destroy(); } catch { /* ignore */ }
             }
-            if (parsed.collapsed !== undefined) {
-              if (typeof parsed.collapsed !== 'boolean') {
-                externalResponse(res, 400, { ok: false, error: 'collapsed must be a boolean' });
-                return;
-              }
-              command.collapsed = parsed.collapsed;
-            }
-            if (parsed.scope !== undefined) {
-              if (!PANEL_SCOPE_VALUES.includes(parsed.scope)) {
-                externalResponse(res, 400, { ok: false, error: `scope must be one of: ${PANEL_SCOPE_VALUES.join(', ')}` });
-                return;
-              }
-              command.scope = parsed.scope;
-            }
-            if (parsed.metric !== undefined) {
-              if (!PANEL_METRIC_VALUES.includes(parsed.metric)) {
-                externalResponse(res, 400, { ok: false, error: `metric must be one of: ${PANEL_METRIC_VALUES.join(', ')}` });
-                return;
-              }
-              command.metric = parsed.metric;
-            }
-            panelCommand.revision = Date.now();
-            panelCommand.command = command;
-            externalResponse(res, 200, { ok: true, value: { ...panelCommand } });
+          };
+          writeLine(); // first line immediately
+          timer = setInterval(writeLine, intervalMs);
+          res.on('close', () => {
+            if (timer !== null) clearInterval(timer);
+            timer = null;
+          });
+          res.on('error', () => {
+            if (timer !== null) clearInterval(timer);
+            timer = null;
           });
         },
       },
@@ -901,6 +947,78 @@ export function apply(ctx, config = {}) {
     });
   }
 
+  /* ---- Windows named pipe channel (CONTRACT.md §12.2) ---- */
+
+  function startPipeServer() {
+    if (!IS_WIN32 || !externalEnabled || pipeServer !== null) return;
+    const server = createNetServer((socket) => {
+      pipeConnections.add(socket);
+      let buffer = '';
+      let timer = null;
+      const cleanup = () => {
+        if (timer !== null) clearInterval(timer);
+        timer = null;
+        pipeConnections.delete(socket);
+        try { socket.destroy(); } catch { /* ignore */ }
+      };
+      const writeJson = (obj) => {
+        try { socket.write(`${JSON.stringify(obj)}\n`); } catch { cleanup(); }
+      };
+      const statsLine = () => {
+        writeJson({ type: 'stats', ts: Date.now(), value: statsPayload() });
+      };
+      statsLine();
+      timer = setInterval(statsLine, 1000);
+      socket.setEncoding('utf8');
+      socket.on('data', (chunk) => {
+        buffer += chunk;
+        if (buffer.length > 65536) {
+          writeJson({ type: 'error', error: 'line too long (64KB cap)' });
+          cleanup();
+          return;
+        }
+        let idx;
+        while ((idx = buffer.indexOf('\n')) !== -1) {
+          const line = buffer.slice(0, idx).trim();
+          buffer = buffer.slice(idx + 1);
+          if (!line) continue;
+          let parsed = null;
+          try { parsed = JSON.parse(line); } catch { parsed = null; }
+          const isCommand = parsed && typeof parsed === 'object' && !Array.isArray(parsed) &&
+            (parsed.items !== undefined || parsed.collapsed !== undefined || parsed.scope !== undefined || parsed.metric !== undefined);
+          if (!isCommand) continue; // non-command lines are ignored
+          const result = validatePanelCommand(parsed);
+          if (!result.ok) {
+            writeJson({ type: 'error', error: result.error });
+          } else {
+            writeJson({ type: 'ack', value: applyPanelCommand(result.command) });
+          }
+        }
+      });
+      socket.on('error', cleanup);
+      socket.on('end', cleanup);
+      socket.on('close', cleanup);
+    });
+    server.on('error', (error) => {
+      logger.warn(`dsh-resmon: named pipe server error: ${String(error?.message ?? error)}`);
+    });
+    pipeServer = server;
+    server.listen(EXTERNAL_PIPE_NAME, () => {
+      logger.debug?.(`dsh-resmon: named pipe listening on ${EXTERNAL_PIPE_NAME}`);
+    });
+  }
+
+  function stopPipeServer() {
+    if (pipeServer === null) return;
+    const server = pipeServer;
+    pipeServer = null;
+    try { server.close(); } catch { /* never listened */ }
+    for (const socket of [...pipeConnections]) {
+      try { socket.destroy(); } catch { /* ignore */ }
+    }
+    pipeConnections.clear();
+  }
+
   /** Chinese Markdown spec for the external API (endpoint table, parameters,
    *  response examples, curl / PowerShell / Python / Node.js / C# snippets,
    *  version and generation time). */
@@ -926,6 +1044,7 @@ export function apply(ctx, config = {}) {
 | GET | /v1/usage?sessionId=... | Token 与费用统计(可选 sessionId) |
 | GET | /v1/panel | 当前面板参数命令 |
 | POST | /v1/panel | 下发面板参数命令(增删监控项/折叠/口径/Token 视图) |
+| GET | /v1/stream?interval=ms | 资源快照流(NDJSON,每行一条) |
 | GET | /v1/spec | 本规范文档(Markdown) |
 
 未知路径返回 404、方法不符返回 405(JSON)。
@@ -1009,6 +1128,131 @@ using var client = new HttpClient { BaseAddress = new Uri("${base}") };
 var stats = await client.GetStringAsync("/v1/stats");
 await client.PostAsync("/v1/panel", new StringContent(
     "{\\"items\\":[\\"cpu\\",\\"gpu\\"]}", System.Text.Encoding.UTF8, "application/json"));
+\`\`\`
+
+## 流式通道
+
+### HTTP 流式端点 /v1/stream
+
+\`GET ${base}/v1/stream?interval=1000\`(interval 毫秒,范围 250–10000,默认 1000;非法值回默认)。响应为 \`application/x-ndjson; charset=utf-8\`(chunked,\`Cache-Control: no-store\`),立即写首行,此后每 interval 写一行,每行一个 JSON、以 \`\\n\` 结尾:
+
+\`\`\`json
+{ "type": "stats", "ts": 1792347556758, "value": { "cpu": 12.3, "mem": { "percent": 41.2 } } }
+\`\`\`
+
+客户端断开连接后服务端即停止写入。
+
+### Windows 命名管道 \\\\.\\pipe\\dsh-resmon
+
+仅 Windows 且 external.enabled 为真时存在。每个连接每 1000ms 收到一行与 /v1/stream 相同结构的 stats NDJSON;客户端也可向管道写 JSON 行(每行以 \`\\n\` 结尾,单行 ≤64KB)下发面板命令,字段与 POST /v1/panel 相同(items/collapsed/scope/metric,全部可选):
+
+- 合法命令 → 回一行 \`{ "type": "ack", "value": { "revision": <ms>, "command": { ... } } }\`
+- 非法命令 → 回一行 \`{ "type": "error", "error": "..." }\`
+- 非命令 JSON 行与无法解析的行被忽略;单行超 64KB 断开连接。
+
+### C 示例一:WinHTTP 流式读(完整可编译)
+
+\`\`\`c
+// stream_winhttp.c — MSVC: cl stream_winhttp.c winhttp.lib | MinGW: gcc stream_winhttp.c -lwinhttp
+#include <windows.h>
+#include <winhttp.h>
+#include <stdio.h>
+
+int main(void) {
+    HINTERNET session = WinHttpOpen(L"dsh-resmon-stream/1.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!session) { fprintf(stderr, "WinHttpOpen failed: %lu\\n", GetLastError()); return 1; }
+    HINTERNET connect = WinHttpConnect(session, L"127.0.0.1", ${externalPort}, 0);
+    HINTERNET request = connect ? WinHttpOpenRequest(connect, L"GET",
+        L"/v1/stream?interval=1000", NULL, WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES, 0) : NULL;
+    if (!request || !WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+            WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+        !WinHttpReceiveResponse(request, NULL)) {
+        fprintf(stderr, "request failed: %lu\\n", GetLastError()); return 1;
+    }
+    char buf[4096]; DWORD n = 0; int lines = 0;
+    while (lines < 5) {                 // 示例:读 5 行后退出
+        DWORD available = 0;
+        if (!WinHttpQueryDataAvailable(request, &available)) break;
+        DWORD want = (available < (DWORD)sizeof(buf)) ? available : (DWORD)sizeof(buf);
+        if (want == 0) { Sleep(50); continue; }
+        if (!WinHttpReadData(request, buf, want, &n) || n == 0) break;
+        for (DWORD i = 0; i < n; i++) if (buf[i] == '\\n') lines++;  // 按行计数/解析
+        fwrite(buf, 1, n, stdout);
+    }
+    WinHttpCloseHandle(request); WinHttpCloseHandle(connect); WinHttpCloseHandle(session);
+    return 0;
+}
+\`\`\`
+
+### C 示例二:命名管道读 + 写面板命令(完整可编译)
+
+\`\`\`c
+// pipe_client.c — MSVC: cl pipe_client.c | MinGW: gcc pipe_client.c
+#include <windows.h>
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
+    HANDLE pipe = CreateFileW(L"\\\\\\\\.\\\\pipe\\\\dsh-resmon",
+        GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+    if (pipe == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "CreateFileW failed: %lu\\n", GetLastError()); return 1;
+    }
+    char buf[8192]; DWORD n = 0; int lines = 0;
+    while (lines < 2) {                  // 1) 读 2 行 stats NDJSON
+        if (!ReadFile(pipe, buf, sizeof(buf) - 1, &n, NULL) || n == 0) break;
+        for (DWORD i = 0; i < n; i++) if (buf[i] == '\\n') lines++;
+        fwrite(buf, 1, n, stdout);
+    }
+    const char cmd[] = "{\\"collapsed\\":true}\\n";   // 2) 写面板命令
+    DWORD written = 0;
+    if (!WriteFile(pipe, cmd, (DWORD)(sizeof(cmd) - 1), &written, NULL)) {
+        fprintf(stderr, "WriteFile failed: %lu\\n", GetLastError());
+    }
+    while (ReadFile(pipe, buf, sizeof(buf) - 1, &n, NULL) && n > 0) {  // 3) 读 ack 行
+        fwrite(buf, 1, n, stdout);
+        if (memchr(buf, '\\n', n)) break;
+    }
+    CloseHandle(pipe);
+    return 0;
+}
+\`\`\`
+
+### C++ 示例:libcurl 回调按行解析(需 libcurl)
+
+\`\`\`cpp
+// stream_curl.cpp — 编译: g++ stream_curl.cpp -lcurl (需安装 libcurl)
+#include <curl/curl.h>
+#include <cstdio>
+#include <string>
+
+static size_t onData(char *ptr, size_t size, size_t nmemb, void *userdata) {
+    std::string &buffer = *static_cast<std::string *>(userdata);
+    buffer.append(ptr, size * nmemb);
+    size_t pos;
+    while ((pos = buffer.find('\\n')) != std::string::npos) {
+        std::string line = buffer.substr(0, pos);
+        buffer.erase(0, pos + 1);
+        std::printf("%s\\n", line.c_str());   // 按行处理(例如解析 JSON)
+    }
+    return size * nmemb;
+}
+
+int main() {
+    CURL *curl = curl_easy_init();
+    if (!curl) return 1;
+    std::string buffer;
+    curl_easy_setopt(curl, CURLOPT_URL, "${base}/v1/stream?interval=1000");
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, onData);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buffer);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 15000L);   // 示例:15 秒后结束
+    CURLcode code = curl_easy_perform(curl);
+    curl_easy_cleanup(curl);
+    return code == CURLE_OK ? 0 : 1;
+}
 \`\`\`
 `;
   }
