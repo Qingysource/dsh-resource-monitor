@@ -125,15 +125,31 @@ window.__ModuleLoader__.load({
     /* ------------------------------------------------------------------ *
      * Host bridge: two authenticated fetch routes                         *
      * ------------------------------------------------------------------ */
-    async function hostFetch(path, payload, signal) {
+    async function hostFetch(path, payload, signal, method = 'POST') {
+      const isGet = method === 'GET';
       const response = await fetch(path, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: payload === undefined ? '{}' : JSON.stringify(payload),
+        method,
+        ...(isGet
+          ? {}
+          : {
+              headers: { 'content-type': 'application/json' },
+              body: payload === undefined ? '{}' : JSON.stringify(payload),
+            }),
         ...(signal === undefined ? {} : { signal }),
       });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const body = await response.json();
+      let body = null;
+      try {
+        body = await response.json();
+      } catch { /* empty or non-JSON body */ }
+      if (!response.ok) {
+        let message = `HTTP ${response.status}`;
+        if (body && body.error) {
+          message = typeof body.error === 'object' && body.error !== null
+            ? (body.error.message || String(body.error))
+            : String(body.error);
+        }
+        throw new Error(message);
+      }
       if (!body || body.ok !== true) throw new Error(body && body.error ? String(body.error) : 'bad response');
       return body.value;
     }
@@ -811,6 +827,342 @@ window.__ModuleLoader__.load({
       );
     }
 
+    /* ------------------------------------------------------------------ *
+     * Settings page (settings.section entry, same level as desktop control)*
+     * ------------------------------------------------------------------ */
+    function normalizeConfig(value) {
+      const v = value || {};
+      const p = v.pricing || {};
+      const pm = p.models || {};
+      const o = v.official || {};
+      const w = v.whale || {};
+      const s = v.sampling || {};
+      return {
+        pricing: {
+          offPeakRatio: p.offPeakRatio != null ? String(p.offPeakRatio) : '',
+          models: {
+            default: typeof pm.default === 'string' ? pm.default : '',
+            overrides: typeof pm.overrides === 'string' ? pm.overrides : '',
+          },
+        },
+        official: {
+          mode: o.mode === 'apikey' || o.mode === 'account' || o.mode === 'off' || o.mode === 'auto' ? o.mode : 'auto',
+          pollSeconds: o.pollSeconds != null ? String(o.pollSeconds) : '',
+        },
+        whale: {
+          enabled: w.enabled === true,
+          path: typeof w.path === 'string' ? w.path : '',
+        },
+        sampling: {
+          netGpuSeconds: s.netGpuSeconds != null ? String(s.netGpuSeconds) : '',
+          diskSeconds: s.diskSeconds != null ? String(s.diskSeconds) : '',
+          dshsizeMinutes: s.dshsizeMinutes != null ? String(s.dshsizeMinutes) : '',
+        },
+      };
+    }
+
+    function SettingsPage({ t }) {
+      useTracked(localeTick); // re-render when the locale switches
+      const [status, setStatus] = useState('loading'); // loading | ready | error
+      const [loadError, setLoadError] = useState('');
+      const [draft, setDraft] = useState(null);
+      const [busy, setBusy] = useState(false);
+      const [notice, setNotice] = useState(null); // { tone: 'ok'|'err', text }
+
+      useEffect(() => {
+        let alive = true;
+        (async () => {
+          try {
+            const value = await hostFetch('/api/dsh-resmon/config', undefined, undefined, 'GET');
+            if (alive) {
+              setDraft(normalizeConfig(value));
+              setStatus('ready');
+            }
+          } catch (error) {
+            if (alive) {
+              setLoadError(error instanceof Error ? error.message : String(error));
+              setStatus('error');
+            }
+          }
+        })();
+        return () => {
+          alive = false;
+        };
+      }, []);
+
+      if (status === 'loading') {
+        return h('div', { className: 'drs-wrap' },
+          h('style', null, SETTINGS_CSS),
+          h('div', { className: 'drs-title' }, t('settingsTitle')),
+          h('div', { className: 'drs-loading' }, t('sLoading')));
+      }
+      if (status === 'error') {
+        return h('div', { className: 'drs-wrap' },
+          h('style', null, SETTINGS_CSS),
+          h('div', { className: 'drs-title' }, t('settingsTitle')),
+          h('div', { className: 'drs-error' }, `${t('sLoadFailed')}: ${loadError}`));
+      }
+
+      const d = draft;
+      const patchPricing = (key, value) => setDraft((current) => ({ ...current, pricing: { ...current.pricing, [key]: value } }));
+      const patchModels = (key, value) => setDraft((current) => ({ ...current, pricing: { ...current.pricing, models: { ...current.pricing.models, [key]: value } } }));
+      const patchOfficial = (key, value) => setDraft((current) => ({ ...current, official: { ...current.official, [key]: value } }));
+      const patchWhale = (key, value) => setDraft((current) => ({ ...current, whale: { ...current.whale, [key]: value } }));
+      const patchSampling = (key, value) => setDraft((current) => ({ ...current, sampling: { ...current.sampling, [key]: value } }));
+
+      const buildPayload = () => {
+        const number = (raw) => {
+          if (raw === '' || raw == null) return null;
+          const n = Number(raw);
+          return isFinite(n) ? n : null;
+        };
+        const pricing = { models: {} };
+        if (number(d.pricing.offPeakRatio) != null) pricing.offPeakRatio = number(d.pricing.offPeakRatio);
+        if (d.pricing.models.default !== '') pricing.models.default = d.pricing.models.default;
+        if (d.pricing.models.overrides !== '') pricing.models.overrides = d.pricing.models.overrides;
+        const official = { mode: d.official.mode };
+        if (number(d.official.pollSeconds) != null) official.pollSeconds = number(d.official.pollSeconds);
+        const sampling = {};
+        if (number(d.sampling.netGpuSeconds) != null) sampling.netGpuSeconds = number(d.sampling.netGpuSeconds);
+        if (number(d.sampling.diskSeconds) != null) sampling.diskSeconds = number(d.sampling.diskSeconds);
+        if (number(d.sampling.dshsizeMinutes) != null) sampling.dshsizeMinutes = number(d.sampling.dshsizeMinutes);
+        return {
+          pricing,
+          official,
+          whale: { enabled: d.whale.enabled === true, path: d.whale.path },
+          sampling,
+        };
+      };
+
+      const save = async (payload, kind) => {
+        setBusy(true);
+        setNotice(null);
+        try {
+          const value = await hostFetch('/api/dsh-resmon/config', payload, undefined, 'POST');
+          setDraft(normalizeConfig(value));
+          setNotice({ tone: 'ok', text: kind === 'reset' ? t('sResetDone') : t('sSaved') });
+        } catch (error) {
+          setNotice({ tone: 'err', text: `${t('sSaveFailed')}: ${error instanceof Error ? error.message : String(error)}` });
+        } finally {
+          setBusy(false);
+        }
+      };
+
+      const onReset = () => void save({
+        pricing: { offPeakRatio: 0.5, models: { overrides: '{}' } },
+        official: { mode: 'auto', pollSeconds: 60 },
+        whale: { enabled: true, path: '' },
+        sampling: { netGpuSeconds: 2, diskSeconds: 5, dshsizeMinutes: 5 },
+      }, 'reset');
+
+      const field = (labelKey, control) => h('label', { className: 'drs-field' },
+        h('span', { className: 'drs-field-label' }, t(labelKey)),
+        control);
+      const fieldBlock = (labelKey, control) => h('div', { className: 'drs-field-block' },
+        h('span', { className: 'drs-field-label' }, t(labelKey)),
+        control);
+
+      return h('div', { className: 'drs-wrap' },
+        h('style', null, SETTINGS_CSS),
+        h('div', { className: 'drs-title' }, t('settingsTitle')),
+        h('div', { className: 'drs-desc' }, t('settingsDesc')),
+        h('div', { className: 'drs-group' },
+          h('div', { className: 'drs-group-title' }, t('sPricing')),
+          field('sOffPeakRatio', h('input', {
+            type: 'number', className: 'drs-input', min: 0, max: 1, step: 0.05,
+            value: d.pricing.offPeakRatio,
+            onChange: (event) => patchPricing('offPeakRatio', event.target.value),
+          })),
+          fieldBlock('sDefaultPrice', h('textarea', {
+            className: 'drs-textarea', rows: 3,
+            value: d.pricing.models.default,
+            placeholder: '{"input":2,"cachedInput":0.5,"output":8}',
+            onChange: (event) => patchModels('default', event.target.value),
+          })),
+          fieldBlock('sOverrides', h('textarea', {
+            className: 'drs-textarea', rows: 3,
+            value: d.pricing.models.overrides,
+            placeholder: '{"deepseek-flash":{"input":2,"cachedInput":0.04,"output":8}}',
+            onChange: (event) => patchModels('overrides', event.target.value),
+          }))),
+        h('div', { className: 'drs-group' },
+          h('div', { className: 'drs-group-title' }, t('sOfficial')),
+          field('sMode', h('select', {
+            className: 'drs-input',
+            value: d.official.mode,
+            onChange: (event) => patchOfficial('mode', event.target.value),
+          },
+            h('option', { value: 'auto' }, t('sModeAuto')),
+            h('option', { value: 'apikey' }, t('sModeApikey')),
+            h('option', { value: 'account' }, t('sModeAccount')),
+            h('option', { value: 'off' }, t('sModeOff')))),
+          field('sPollSeconds', h('input', {
+            type: 'number', className: 'drs-input', min: 15, max: 600,
+            value: d.official.pollSeconds,
+            onChange: (event) => patchOfficial('pollSeconds', event.target.value),
+          }))),
+        h('div', { className: 'drs-group' },
+          h('div', { className: 'drs-group-title' }, t('sWhale')),
+          field('sWhaleEnabled', h('input', {
+            type: 'checkbox',
+            checked: d.whale.enabled,
+            onChange: (event) => patchWhale('enabled', event.target.checked),
+          })),
+          field('sWhalePath', h('input', {
+            type: 'text', className: 'drs-input drs-input-wide',
+            value: d.whale.path,
+            placeholder: t('sWhalePathHint'),
+            onChange: (event) => patchWhale('path', event.target.value),
+          }))),
+        h('div', { className: 'drs-group' },
+          h('div', { className: 'drs-group-title' }, t('sSampling')),
+          field('sNetGpu', h('input', {
+            type: 'number', className: 'drs-input', min: 1, max: 30,
+            value: d.sampling.netGpuSeconds,
+            onChange: (event) => patchSampling('netGpuSeconds', event.target.value),
+          })),
+          field('sDisk', h('input', {
+            type: 'number', className: 'drs-input', min: 2, max: 120,
+            value: d.sampling.diskSeconds,
+            onChange: (event) => patchSampling('diskSeconds', event.target.value),
+          })),
+          field('sDshSize', h('input', {
+            type: 'number', className: 'drs-input', min: 1, max: 120,
+            value: d.sampling.dshsizeMinutes,
+            onChange: (event) => patchSampling('dshsizeMinutes', event.target.value),
+          }))),
+        h('div', { className: 'drs-actions' },
+          h('button', { type: 'button', className: 'drs-btn drs-btn-primary', disabled: busy, onClick: () => void save(buildPayload(), 'save') }, t('sSave')),
+          h('button', { type: 'button', className: 'drs-btn', disabled: busy, onClick: onReset }, t('sReset')),
+          notice ? h('span', { className: notice.tone === 'ok' ? 'drs-notice drs-notice-ok' : 'drs-notice drs-notice-err' }, notice.text) : null));
+    }
+
+    const SETTINGS_CSS = `
+      .drs-wrap {
+        max-width: 640px;
+        padding: 8px 2px 16px;
+        font-size: 13px;
+        line-height: 1.5;
+        color: var(--dsw-alias-label-primary);
+      }
+      .drs-title {
+        font-size: 15px;
+        font-weight: 600;
+        margin-bottom: 4px;
+      }
+      .drs-desc {
+        color: var(--dsw-alias-label-secondary);
+        font-size: 12px;
+        margin-bottom: 12px;
+      }
+      .drs-loading {
+        color: var(--dsw-alias-label-secondary);
+      }
+      .drs-error {
+        color: var(--dsw-alias-state-error-primary);
+        font-size: 12.5px;
+      }
+      .drs-group {
+        border: 1px solid var(--dsw-alias-border-l1);
+        border-radius: 10px;
+        background: var(--dsw-alias-bg-layer-1);
+        padding: 10px 12px;
+        margin-bottom: 10px;
+      }
+      .drs-group-title {
+        font-weight: 600;
+        font-size: 12.5px;
+        margin-bottom: 6px;
+      }
+      .drs-field {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin-top: 6px;
+      }
+      .drs-field-label {
+        color: var(--dsw-alias-label-secondary);
+        font-size: 12px;
+        flex: 0 0 150px;
+      }
+      .drs-field-block {
+        margin-top: 8px;
+      }
+      .drs-field-block .drs-field-label {
+        display: block;
+        margin-bottom: 4px;
+      }
+      .drs-input {
+        width: 120px;
+        box-sizing: border-box;
+        border: 1px solid var(--dsw-alias-border-l2);
+        background: var(--dsw-alias-bg-layer-2);
+        color: var(--dsw-alias-label-primary);
+        border-radius: 6px;
+        padding: 4px 8px;
+        font-size: 12px;
+        font-family: inherit;
+      }
+      .drs-input-wide {
+        width: 280px;
+      }
+      .drs-textarea {
+        box-sizing: border-box;
+        width: 100%;
+        border: 1px solid var(--dsw-alias-border-l2);
+        background: var(--dsw-alias-bg-layer-2);
+        color: var(--dsw-alias-label-primary);
+        border-radius: 6px;
+        padding: 6px 8px;
+        font-size: 12px;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        resize: vertical;
+      }
+      .drs-actions {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin-top: 4px;
+      }
+      .drs-btn {
+        border: 1px solid var(--dsw-alias-border-l2);
+        background: var(--dsw-alias-bg-layer-2);
+        color: var(--dsw-alias-label-primary);
+        border-radius: 6px;
+        padding: 5px 14px;
+        font-size: 12px;
+        cursor: pointer;
+        font-family: inherit;
+      }
+      .drs-btn:hover {
+        border-color: var(--dsw-alias-border-l1);
+        background: var(--dsw-alias-bg-layer-1);
+      }
+      .drs-btn:disabled {
+        opacity: 0.55;
+        cursor: default;
+      }
+      .drs-btn-primary {
+        background: var(--dsw-alias-brand-primary);
+        border-color: transparent;
+        color: #ffffff;
+      }
+      .drs-btn-primary:hover {
+        background: var(--dsw-alias-brand-primary);
+        border-color: transparent;
+        color: #ffffff;
+      }
+      .drs-notice {
+        font-size: 12px;
+      }
+      .drs-notice-ok {
+        color: var(--dsw-alias-state-success-primary);
+      }
+      .drs-notice-err {
+        color: var(--dsw-alias-state-error-primary);
+      }
+    `;
+
     const PANEL_CSS = `
       .drm-root {
         position: fixed;
@@ -1163,6 +1515,35 @@ window.__ModuleLoader__.load({
             recharge: 'Recharge',
             sourceOfficialPlatform: 'Official platform',
             officialMonth: 'Official this month',
+            settingsNav: 'Resource Monitor',
+            settingsTitle: 'Resource Monitor Settings',
+            settingsDesc: 'Configure pricing, the official data source, the whale ledger and the sampling cadence. Changes apply immediately.',
+            sPricing: 'Pricing',
+            sOffPeakRatio: 'Off-peak price ratio',
+            sDefaultPrice: 'Default pricing (JSON)',
+            sOverrides: 'Model price overrides (JSON)',
+            sOfficial: 'Official data source',
+            sMode: 'Mode',
+            sModeAuto: 'Auto',
+            sModeApikey: 'API key',
+            sModeAccount: 'Account',
+            sModeOff: 'Off',
+            sPollSeconds: 'Balance poll interval (s)',
+            sWhale: 'Whale ledger',
+            sWhaleEnabled: 'Enabled',
+            sWhalePath: 'Ledger path',
+            sWhalePathHint: 'empty = default ~/.dsh/.dshw-usage.json',
+            sSampling: 'Sampling',
+            sNetGpu: 'Net/GPU interval (s)',
+            sDisk: 'Disk interval (s)',
+            sDshSize: 'DSH size recompute (min)',
+            sSave: 'Save & apply',
+            sSaved: 'Saved and applied',
+            sReset: 'Reset to defaults',
+            sResetDone: 'Defaults restored and applied',
+            sLoadFailed: 'Failed to load config',
+            sSaveFailed: 'Save failed',
+            sLoading: 'Loading…',
           },
           zh: {
             title: '资源监控',
@@ -1234,6 +1615,35 @@ window.__ModuleLoader__.load({
             recharge: '充值',
             sourceOfficialPlatform: '官方平台',
             officialMonth: '官方本月',
+            settingsNav: '资源监控',
+            settingsTitle: '资源监控设置',
+            settingsDesc: '配置计价、官方数据源、小鲸鱼账本与采样节奏;保存后立即生效,无需重启。',
+            sPricing: '计价配置',
+            sOffPeakRatio: '空闲时段价格系数',
+            sDefaultPrice: '兜底计价(JSON)',
+            sOverrides: '模型计价覆盖(JSON)',
+            sOfficial: '官方数据源',
+            sMode: '模式',
+            sModeAuto: '自动',
+            sModeApikey: 'API Key',
+            sModeAccount: '账户登录',
+            sModeOff: '关闭',
+            sPollSeconds: '余额轮询间隔(秒)',
+            sWhale: '小鲸鱼账本',
+            sWhaleEnabled: '启用',
+            sWhalePath: '账本路径',
+            sWhalePathHint: '空=默认 ~/.dsh/.dshw-usage.json',
+            sSampling: '采样节奏',
+            sNetGpu: '网络/GPU 间隔(秒)',
+            sDisk: '磁盘间隔(秒)',
+            sDshSize: 'DSH 占用重算(分钟)',
+            sSave: '保存并生效',
+            sSaved: '已保存并生效',
+            sReset: '恢复默认',
+            sResetDone: '已恢复默认并生效',
+            sLoadFailed: '加载配置失败',
+            sSaveFailed: '保存失败',
+            sLoading: '加载中…',
           },
         };
         ctx.locale.register('dsh-resmon', 'en', dicts.en);
@@ -1254,6 +1664,21 @@ window.__ModuleLoader__.load({
           { name: 'shell.overlay', id: 'dsh-resmon-panel', order: 0, label: () => t('title') },
           () => h(Panel, { t, getLocale: () => ctx.locale.getLocale().active }),
         ));
+
+        // Standalone settings page, same level as the desktop-control entry.
+        ctx.slots.inject('settings.section', () => ctx.slots.register({
+          name: 'settings.section',
+          id: 'dsh-resmon',
+          order: 430,
+          locale: 'dsh-resmon',
+          label: () => {
+            try {
+              return ctx.locale.bind('dsh-resmon')('settingsNav');
+            } catch {
+              return '资源监控';
+            }
+          },
+        }, (props) => h(SettingsPage, { ...props, t })));
       },
     };
   },

@@ -11,7 +11,8 @@
  * fetch routes (`/api/dsh-resmon/stats|usage`).
  */
 import os from 'node:os';
-import { readdir, readFile, stat, statfs } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
+import { mkdir, readdir, readFile, rename, stat, statfs, unlink, writeFile } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -129,6 +130,10 @@ const ZSTD_MAGIC = 0xfd2fb528;
  *  allowed to contact; the API key never leaves this origin. */
 const OFFICIAL_BALANCE_URL = 'https://api.deepseek.com/user/balance';
 const OFFICIAL_BALANCE_INTERVAL_MS = 60000; // snapshot cadence (source re-probed every tick)
+
+/** Runtime-editable JSON config file: <home>/.dsh-resmon-config.json.
+ *  Priority: file > schemastery Config > built-in defaults. */
+const CONFIG_FILENAME = '.dsh-resmon-config.json';
 
 function round2(value) {
   return Math.round(value * 100) / 100;
@@ -484,8 +489,13 @@ export function apply(ctx, config = {}) {
   const logger = ctx.logger ?? console;
   const cfg = config && typeof config === 'object' ? config : {};
 
-  /* ---- config → pricing: merge models.default / models.overrides JSON
-   *      into the effective PRICING table (bad JSON → warn + built-in). ---- */
+  /* ================================================================== *
+   * 0. Runtime configuration                                             *
+   *    Priority: JSON file (>homeDir()/.dsh-resmon-config.json)         *
+   *              > schemastery Config > built-in defaults.              *
+   *    GET/POST /api/dsh-resmon/config read/write the file and apply    *
+   *    changes immediately (pricing, cadences, official timer).         *
+   * ================================================================== */
   function parsePriceEntry(value) {
     if (!value || typeof value !== 'object') return null;
     const input = Number(value.input);
@@ -494,67 +504,220 @@ export function apply(ctx, config = {}) {
     if (!Number.isFinite(input) || !Number.isFinite(cachedInput) || !Number.isFinite(output)) return null;
     return { input, cachedInput, output };
   }
-  (function applyPricingConfig() {
-    const pricing = cfg.pricing;
-    if (pricing && typeof pricing === 'object') {
-      const ratio = Number(pricing.offPeakRatio);
-      if (Number.isFinite(ratio) && ratio >= 0 && ratio <= 1) OFF_PEAK_RATIO = ratio;
-    }
-    const effective = { ...BUILTIN_PRICING };
-    const models = pricing && typeof pricing === 'object' ? pricing.models : null;
-    if (models && typeof models === 'object') {
-      if (typeof models.default === 'string' && models.default.trim() !== '') {
-        try {
-          const entry = parsePriceEntry(JSON.parse(models.default));
-          if (entry) effective.default = entry;
-        } catch (error) {
-          logger.warn(`dsh-resmon: invalid pricing.models.default JSON, keeping built-in: ${String(error?.message ?? error)}`);
-        }
-      }
-      if (typeof models.overrides === 'string' && models.overrides.trim() !== '') {
-        try {
-          const overrides = JSON.parse(models.overrides);
-          if (overrides && typeof overrides === 'object' && !Array.isArray(overrides)) {
-            for (const [modelId, value] of Object.entries(overrides)) {
-              const entry = parsePriceEntry(value);
-              if (entry) effective[modelId] = entry;
-            }
-          }
-        } catch (error) {
-          logger.warn(`dsh-resmon: invalid pricing.models.overrides JSON, keeping built-in: ${String(error?.message ?? error)}`);
-        }
-      }
-    }
-    PRICING = effective;
-  })();
 
-  /* ---- config → sampling cadences (seconds/minutes → 1 s ticks). ---- */
-  const sampling = cfg.sampling;
+  function defaultConfig() {
+    return {
+      pricing: {
+        offPeakRatio: 0.5,
+        models: {
+          default: JSON.stringify(BUILTIN_PRICING.default),
+          overrides: '{}',
+        },
+      },
+      official: { mode: 'auto', pollSeconds: 60 },
+      whale: { enabled: true, path: '' },
+      sampling: { netGpuSeconds: 2, diskSeconds: 5, dshsizeMinutes: 5 },
+    };
+  }
+
+  function cloneConfig(value) {
+    return JSON.parse(JSON.stringify(value));
+  }
+
+  /** Validate a partial config patch against the current values and merge.
+   *  Numbers must lie inside the Config min/max ranges, official.mode must be
+   *  one of the enum values, models.default/overrides must parse as JSON and
+   *  pass parsePriceEntry, whale.path must be a string. */
+  function validateConfigPatch(base, patch) {
+    if (!patch || typeof patch !== 'object' || Array.isArray(patch)) return { ok: false, error: 'config body must be an object' };
+    const merged = cloneConfig(base);
+    const numIn = (value, min, max, name) => {
+      const n = Number(value);
+      if (!Number.isFinite(n) || n < min || n > max) return { ok: false, error: `${name} must be a number within [${min}, ${max}]` };
+      return { ok: true, value: n };
+    };
+    if (patch.pricing !== undefined) {
+      if (!patch.pricing || typeof patch.pricing !== 'object' || Array.isArray(patch.pricing)) return { ok: false, error: 'pricing must be an object' };
+      const p = patch.pricing;
+      if (p.offPeakRatio !== undefined) {
+        const r = numIn(p.offPeakRatio, 0, 1, 'pricing.offPeakRatio');
+        if (!r.ok) return r;
+        merged.pricing.offPeakRatio = r.value;
+      }
+      if (p.models !== undefined) {
+        if (!p.models || typeof p.models !== 'object' || Array.isArray(p.models)) return { ok: false, error: 'pricing.models must be an object' };
+        const m = p.models;
+        for (const key of ['default', 'overrides']) {
+          if (m[key] === undefined) continue;
+          if (typeof m[key] !== 'string') return { ok: false, error: `pricing.models.${key} must be a JSON string` };
+          try {
+            const parsed = JSON.parse(m[key]);
+            if (key === 'default') {
+              if (!parsePriceEntry(parsed)) return { ok: false, error: 'pricing.models.default must parse to {input, cachedInput, output} numbers' };
+            } else {
+              if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { ok: false, error: 'pricing.models.overrides must parse to an object of {input, cachedInput, output}' };
+              for (const [modelId, entry] of Object.entries(parsed)) {
+                if (!parsePriceEntry(entry)) return { ok: false, error: `pricing.models.overrides["${modelId}"] must be {input, cachedInput, output} numbers` };
+              }
+            }
+          } catch {
+            return { ok: false, error: `pricing.models.${key} is not valid JSON` };
+          }
+          merged.pricing.models[key] = m[key];
+        }
+      }
+    }
+    if (patch.official !== undefined) {
+      if (!patch.official || typeof patch.official !== 'object' || Array.isArray(patch.official)) return { ok: false, error: 'official must be an object' };
+      const o = patch.official;
+      if (o.mode !== undefined) {
+        if (!['auto', 'apikey', 'account', 'off'].includes(o.mode)) return { ok: false, error: "official.mode must be one of auto|apikey|account|off" };
+        merged.official.mode = o.mode;
+      }
+      if (o.pollSeconds !== undefined) {
+        const r = numIn(o.pollSeconds, 15, 600, 'official.pollSeconds');
+        if (!r.ok) return r;
+        merged.official.pollSeconds = r.value;
+      }
+    }
+    if (patch.whale !== undefined) {
+      if (!patch.whale || typeof patch.whale !== 'object' || Array.isArray(patch.whale)) return { ok: false, error: 'whale must be an object' };
+      const w = patch.whale;
+      if (w.enabled !== undefined) {
+        if (typeof w.enabled !== 'boolean') return { ok: false, error: 'whale.enabled must be a boolean' };
+        merged.whale.enabled = w.enabled;
+      }
+      if (w.path !== undefined) {
+        if (typeof w.path !== 'string') return { ok: false, error: 'whale.path must be a string' };
+        merged.whale.path = w.path.trim();
+      }
+    }
+    if (patch.sampling !== undefined) {
+      if (!patch.sampling || typeof patch.sampling !== 'object' || Array.isArray(patch.sampling)) return { ok: false, error: 'sampling must be an object' };
+      const s = patch.sampling;
+      const fields = [
+        ['netGpuSeconds', 1, 30],
+        ['diskSeconds', 2, 120],
+        ['dshsizeMinutes', 1, 120],
+      ];
+      for (const [key, min, max] of fields) {
+        if (s[key] === undefined) continue;
+        const r = numIn(s[key], min, max, `sampling.${key}`);
+        if (!r.ok) return r;
+        merged.sampling[key] = r.value;
+      }
+    }
+    return { ok: true, value: merged };
+  }
+
+  /* Runtime variables derived from the effective config (mutable so a
+   *  config POST can re-apply them without restarting the plugin). */
+  let effectiveCfg = defaultConfig();
+  let officialTimer = null;
+  let officialMode = 'auto';
+  let officialPollMs = OFFICIAL_BALANCE_INTERVAL_MS;
+  let whaleEnabled = true;
+  let whalePath = '';
   let netGpuEveryTicks = 2;
   let diskEveryTicks = 5;
   let dshsizeEveryTicks = 300;
-  if (sampling && typeof sampling === 'object') {
-    const n = Number(sampling.netGpuSeconds);
-    if (Number.isFinite(n) && n >= 1) netGpuEveryTicks = Math.max(1, Math.round(n));
-    const d = Number(sampling.diskSeconds);
-    if (Number.isFinite(d) && d >= 2) diskEveryTicks = Math.max(2, Math.round(d));
-    const m = Number(sampling.dshsizeMinutes);
-    if (Number.isFinite(m) && m >= 1) dshsizeEveryTicks = Math.max(60, Math.round(m * 60));
+
+  /** (Re)start the official-balance polling interval with the current
+   *  pollSeconds (a config change rebuilds the timer). */
+  function startOfficialTimer() {
+    if (officialTimer !== null) clearInterval(officialTimer);
+    officialTimer = setInterval(() => { sampleOfficialBalance().catch(() => {}); }, officialPollMs);
   }
 
-  /* ---- config → official data source. ---- */
-  const officialCfg = cfg.official;
-  const officialMode = officialCfg && typeof officialCfg === 'object' &&
-    ['auto', 'apikey', 'account', 'off'].includes(officialCfg.mode) ? officialCfg.mode : 'auto';
-  const officialPollSeconds = officialCfg && typeof officialCfg === 'object' ? Number(officialCfg.pollSeconds) : NaN;
-  const officialPollMs = Number.isFinite(officialPollSeconds) && officialPollSeconds >= 15 && officialPollSeconds <= 600
-    ? Math.round(officialPollSeconds * 1000) : OFFICIAL_BALANCE_INTERVAL_MS;
+  /** Push the effective config into all runtime variables. */
+  function applyEffectiveConfig() {
+    const pricing = effectiveCfg.pricing;
+    const ratio = Number(pricing.offPeakRatio);
+    OFF_PEAK_RATIO = Number.isFinite(ratio) && ratio >= 0 && ratio <= 1 ? ratio : 0.5;
+    const effective = { ...BUILTIN_PRICING };
+    const models = pricing.models;
+    if (typeof models.default === 'string' && models.default.trim() !== '') {
+      try {
+        const entry = parsePriceEntry(JSON.parse(models.default));
+        if (entry) effective.default = entry;
+      } catch (error) {
+        logger.warn(`dsh-resmon: invalid pricing.models.default JSON, keeping built-in: ${String(error?.message ?? error)}`);
+      }
+    }
+    if (typeof models.overrides === 'string' && models.overrides.trim() !== '') {
+      try {
+        const overrides = JSON.parse(models.overrides);
+        if (overrides && typeof overrides === 'object' && !Array.isArray(overrides)) {
+          for (const [modelId, value] of Object.entries(overrides)) {
+            const entry = parsePriceEntry(value);
+            if (entry) effective[modelId] = entry;
+          }
+        }
+      } catch (error) {
+        logger.warn(`dsh-resmon: invalid pricing.models.overrides JSON, keeping built-in: ${String(error?.message ?? error)}`);
+      }
+    }
+    PRICING = effective;
+    const mode = effectiveCfg.official.mode;
+    officialMode = ['auto', 'apikey', 'account', 'off'].includes(mode) ? mode : 'auto';
+    const poll = Number(effectiveCfg.official.pollSeconds);
+    officialPollMs = Number.isFinite(poll) && poll >= 15 && poll <= 600
+      ? Math.round(poll * 1000) : OFFICIAL_BALANCE_INTERVAL_MS;
+    whaleEnabled = effectiveCfg.whale.enabled !== false;
+    whalePath = typeof effectiveCfg.whale.path === 'string' ? effectiveCfg.whale.path.trim() : '';
+    const s = effectiveCfg.sampling;
+    const n = Number(s.netGpuSeconds);
+    netGpuEveryTicks = Number.isFinite(n) && n >= 1 ? Math.max(1, Math.round(n)) : 2;
+    const d = Number(s.diskSeconds);
+    diskEveryTicks = Number.isFinite(d) && d >= 2 ? Math.max(2, Math.round(d)) : 5;
+    const m = Number(s.dshsizeMinutes);
+    dshsizeEveryTicks = Number.isFinite(m) && m >= 1 ? Math.max(60, Math.round(m * 60)) : 300;
+    startOfficialTimer();
+  }
 
-  /* ---- config → whale ledger. ---- */
-  const whaleCfg = cfg.whale;
-  const whaleEnabled = !whaleCfg || typeof whaleCfg !== 'object' || whaleCfg.enabled !== false;
-  const whalePath = whaleCfg && typeof whaleCfg === 'object' && typeof whaleCfg.path === 'string'
-    ? whaleCfg.path.trim() : '';
+  /** Atomic config write: temp file + rename (mkdir -p first). */
+  async function writeConfigFile(value) {
+    const home = homeDir();
+    if (!home) throw new Error('cannot resolve the home directory');
+    const target = join(home, CONFIG_FILENAME);
+    const tmp = `${target}.tmp-${process.pid}-${Date.now()}`;
+    try {
+      await mkdir(dirname(target), { recursive: true });
+      await writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+      await rename(tmp, target);
+    } catch (error) {
+      try { await unlink(tmp); } catch { /* best effort */ }
+      throw error;
+    }
+  }
+
+  /** POST body → validate → persist → immediate apply. Throws on failure. */
+  async function configPostValue(body) {
+    const merged = validateConfigPatch(effectiveCfg, body);
+    if (!merged.ok) throw new Error(merged.error);
+    await writeConfigFile(merged.value);
+    effectiveCfg = merged.value;
+    applyEffectiveConfig();
+    return cloneConfig(effectiveCfg);
+  }
+
+  /* ---- boot: schemastery Config over defaults, then the JSON file wins ---- */
+  const cfgMerged = validateConfigPatch(defaultConfig(), cfg);
+  if (cfgMerged.ok) effectiveCfg = cfgMerged.value;
+  else logger.warn(`dsh-resmon: ignoring invalid schemastery config: ${cfgMerged.error}`);
+  let fileCfg = null;
+  try {
+    const home = homeDir();
+    if (home) fileCfg = JSON.parse(readFileSync(join(home, CONFIG_FILENAME), 'utf8'));
+  } catch {
+    fileCfg = null; // missing / unreadable / corrupt → defaults win
+  }
+  if (fileCfg !== null) {
+    const merged = validateConfigPatch(effectiveCfg, fileCfg);
+    if (merged.ok) effectiveCfg = merged.value;
+    else logger.warn(`dsh-resmon: ignoring invalid ${CONFIG_FILENAME}: ${merged.error}`);
+  }
+  applyEffectiveConfig();
 
   /* ------------------------------------------------------------------ *
    * 1. CPU / memory / disk / network / GPU sampling                     *
@@ -1888,11 +2051,12 @@ export function apply(ctx, config = {}) {
     sampleOfficialBalance().catch(() => {}); // first official probe + snapshot
     const persistTimer = setInterval(persist, PERSIST_INTERVAL_MS);
     const backfillTimer = setInterval(() => { scanSessionStore().catch(() => {}); }, BACKFILL_INTERVAL_MS);
-    const officialTimer = setInterval(() => { sampleOfficialBalance().catch(() => {}); }, officialPollMs);
+    // The official polling timer is owned by startOfficialTimer() so a config
+    // change can rebuild it; just make sure cleanup reaches it.
     ctx.effect(() => () => {
       clearInterval(persistTimer);
       clearInterval(backfillTimer);
-      clearInterval(officialTimer);
+      if (officialTimer !== null) clearInterval(officialTimer);
       if (domain) persist().catch(() => {});
     });
   })().catch((error) => logger.warn(`dsh-resmon: boot folding failed: ${String(error?.message ?? error)}`));
@@ -2083,6 +2247,28 @@ export function apply(ctx, config = {}) {
         return Response.json({ ok: true, value: usagePayload(sessionId) });
       } catch (error) {
         return Response.json({ ok: false, error: String(error?.message ?? error) }, { status: 500 });
+      }
+    },
+  }));
+
+  // Runtime config: GET returns the current effective values (file >
+  // schemastery Config > built-in); POST validates a partial object, writes
+  // the JSON file atomically and applies it immediately.
+  ctx.effect(() => ctx.connection.fetch.register({
+    path: '/api/dsh-resmon/config',
+    methods: ['GET', 'POST'],
+    requestBody: 'buffered',
+    fetch: async (request) => {
+      try {
+        if (request.method === 'GET') {
+          return Response.json({ ok: true, value: cloneConfig(effectiveCfg) });
+        }
+        let body = null;
+        try { body = await request.json(); } catch { body = null; }
+        const value = await configPostValue(body);
+        return Response.json({ ok: true, value });
+      } catch (error) {
+        return Response.json({ ok: false, error: { message: String(error?.message ?? error) } }, { status: 400 });
       }
     },
   }));

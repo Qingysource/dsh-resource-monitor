@@ -54,7 +54,7 @@ dsh plugin install ./dsh-resmon
 
 ## 设置(DSH 设置 → 插件 → 资源监控 → 配置)
 
-插件声明了原生配置 schema,可在 DSH 设置中可视化编辑(保存后随 profile 补丁持久化):
+设置入口在 **DSH 设置侧栏「资源监控」**(与「桌面控制」同级),页面内表单编辑、保存后立即生效(写入 `$DSH_HOME/.dsh-resmon-config.json`,无需重启;文件配置优先于插件管理器的 Config,后者优先于内置默认):
 
 | 分组 | 可编辑项 |
 |---|---|
