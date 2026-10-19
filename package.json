@@ -10,6 +10,9 @@
     "./icon": "./icon.svg"
   },
   "files": ["index.js", "client.js", "cordis.patch.yml", "locale/*.json", "icon.svg"],
+  "dependencies": {
+    "@deepseek-ai/schemastery": "~3.18.5"
+  },
   "dsh": {
     "bundle": { "patch": "./cordis.patch.yml" },
     "client": {

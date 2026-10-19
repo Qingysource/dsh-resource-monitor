@@ -477,6 +477,7 @@ window.__ModuleLoader__.load({
 
       const officialTodayPlatform = !!(official && official.todayCost != null);
       const officialWhaleToday = !!(official && official.whaleToday != null);
+      const officialWhaleCumulative = !!(official && official.whaleCumulative != null);
       const officialToday = !!(official && official.source != null && official.todayUsed != null);
 
       const costValueFor = (key) => {
@@ -485,6 +486,7 @@ window.__ModuleLoader__.load({
           if (officialWhaleToday) return official.whaleToday;
           if (officialToday) return official.todayUsed;
         }
+        if (key === 'cumulative' && officialWhaleCumulative) return official.whaleCumulative;
         return cost ? cost[key] : null;
       };
 
@@ -688,7 +690,9 @@ window.__ModuleLoader__.load({
             ? fmtCost(official.whaleToday)
             : officialToday
               ? fmtCost(official.todayUsed)
-              : fmtCost(cost ? cost.cumulative : null) };
+              : officialWhaleCumulative
+                ? fmtCost(official.whaleCumulative)
+                : fmtCost(cost ? cost.cumulative : null) };
         return { label: null, text: '—' };
       };
 

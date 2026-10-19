@@ -16,35 +16,37 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { zstdDecompressSync } from 'node:zlib';
+import z from '@deepseek-ai/schemastery';
 
 const MAX_SAMPLES = 90;
 const PERSIST_INTERVAL_MS = 30000;
 const IS_WIN32 = process.platform === 'win32';
 
-// Sub-sampling cadences, expressed in units of the 1-second sample tick.
-const NET_GPU_EVERY_TICKS = 2;
-const DISK_EVERY_TICKS = 5;
-const DISK_REPROBE_EVERY_TICKS = 300; // 5 minutes
-
-/** Official PEAK pricing table, CNY per million tokens.
+/** Built-in official PEAK pricing table, CNY per million tokens.
  *  Verified 2026-10-19 against api-docs.deepseek.com (Lead's research):
  *  - `deepseek-flash`            peak: input 2 / cachedInput 0.04 / output 8
  *  - `deepseek-v4-pro`           peak: input 9.0 / cachedInput 0.30 / output 27.0
  *  - Legacy aliases billed as flash: deepseek-v4-flash, deepseek-v4-flash-vision-exp
  *  - Discontinued models (deepseek-chat, deepseek-reasoner) are deliberately NOT
  *    listed, so they fall through to `default` like any unknown model id.
- *  - Off-peak prices are exactly half of peak (see periodAt/priceFor below).
+ *  - Off-peak prices are peak × OFF_PEAK_RATIO (see periodAt/priceFor below).
  *  Peak window = Beijing time Mon–Fri 09:00–12:00 & 14:00–18:00 (effective since
  *  2026-08-16). The official page states peak excludes Chinese statutory
  *  holidays; this plugin cannot embed a holiday table, so holidays are
  *  conservatively billed at peak prices. */
-const PRICING = {
+const BUILTIN_PRICING = {
   'deepseek-flash': { input: 2, cachedInput: 0.04, output: 8 },
   'deepseek-v4-pro': { input: 9.0, cachedInput: 0.30, output: 27.0 },
   'deepseek-v4-flash': { input: 2, cachedInput: 0.04, output: 8 },
   'deepseek-v4-flash-vision-exp': { input: 2, cachedInput: 0.04, output: 8 },
   default: { input: 9.0, cachedInput: 0.30, output: 27.0 },
 };
+
+/** Effective pricing table — starts as the built-in; each apply() replaces it
+ *  from the Config (pricing.models.default / pricing.models.overrides JSON). */
+let PRICING = { ...BUILTIN_PRICING };
+/** Off-peak multiplier applied to peak prices (configurable). */
+let OFF_PEAK_RATIO = 0.5;
 
 /** Peak/off-peak billing period at a given instant (Beijing time, UTC+8, no
  *  DST). Unknown or unparseable instants conservatively count as peak.
@@ -297,6 +299,47 @@ function whaleTodayOf(ledger, todayKey) {
   return value;
 }
 
+/** Cumulative (all-days) usage from the whale ledger: Σ debitUnits/1e8 across
+ *  every day of the active book; without usable accounting data, Σ of the
+ *  top-level history values. Null when neither yields a number. */
+function whaleCumulativeOf(ledger) {
+  if (!ledger || typeof ledger !== 'object') return null;
+  let sum = null;
+  const accounting = ledger.accounting;
+  if (accounting && typeof accounting === 'object' && typeof accounting.active === 'string') {
+    const books = accounting.books;
+    if (books && typeof books === 'object') {
+      const book = books[accounting.active];
+      if (book && typeof book === 'object' && book.days && typeof book.days === 'object' && !Array.isArray(book.days)) {
+        let total = 0;
+        let count = 0;
+        for (const day of Object.values(book.days)) {
+          if (day && typeof day === 'object' && typeof day.debitUnits === 'number' && Number.isFinite(day.debitUnits)) {
+            total += day.debitUnits;
+            count += 1;
+          }
+        }
+        if (count > 0) sum = total / 1e8;
+      }
+    }
+  }
+  if (sum === null) {
+    const history = ledger.history;
+    if (history && typeof history === 'object' && !Array.isArray(history)) {
+      let total = 0;
+      let count = 0;
+      for (const value of Object.values(history)) {
+        if (typeof value === 'number' && Number.isFinite(value)) {
+          total += value;
+          count += 1;
+        }
+      }
+      if (count > 0) sum = total;
+    }
+  }
+  return sum;
+}
+
 /** Structural scan of a multi-frame zstd stream — mirrors the Harness
  *  `scanZstdFrames` (Buffer reads only, no zlib). One deliberate deviation:
  *  the official code throws when the current offset no longer starts with
@@ -356,11 +399,15 @@ function peakPriceFor(modelId) {
   return PRICING.default;
 }
 
-/** Effective unit price at a given instant (off-peak = half of peak). */
+/** Effective unit price at a given instant (off-peak = peak × ratio). */
 function priceFor(modelId, timeMs) {
   const peak = peakPriceFor(modelId);
   if (periodAt(timeMs) === 'offpeak') {
-    return { input: peak.input / 2, cachedInput: peak.cachedInput / 2, output: peak.output / 2 };
+    return {
+      input: peak.input * OFF_PEAK_RATIO,
+      cachedInput: peak.cachedInput * OFF_PEAK_RATIO,
+      output: peak.output * OFF_PEAK_RATIO,
+    };
   }
   return { input: peak.input, cachedInput: peak.cachedInput, output: peak.output };
 }
@@ -407,8 +454,107 @@ function isSessionEventLike(first, second) {
 
 export const inject = ['connection'];
 
-export function apply(ctx) {
+/** Settings-editor schema (DSH 设置 → 插件 renders a form from this; the
+ *  Loader validates and persists the parsed config into the profile patch).
+ *  Defaults mirror the built-in behaviour exactly (CONTRACT.md §9.2). */
+export const Config = z.object({
+  pricing: z.object({
+    offPeakRatio: z.number().min(0).max(1).default(0.5).description('空闲时段价格系数(高峰×该系数)'),
+    models: z.object({
+      default: z.string().default(JSON.stringify(BUILTIN_PRICING.default)).description('default 兜底计价(JSON,如 {"input":9.0,"cachedInput":0.30,"output":27.0})'),
+      overrides: z.string().default('{}').description('模型计价覆盖(JSON,如 {"deepseek-flash":{"input":2,"cachedInput":0.04,"output":8}})'),
+    }).description('模型计价(JSON)'),
+  }).description('计价配置').default({}),
+  official: z.object({
+    mode: z.union(['auto', 'apikey', 'account', 'off']).default('auto').description('官方数据源模式(auto=自动探测)'),
+    pollSeconds: z.number().min(15).max(600).default(60).description('官方余额轮询间隔(秒)'),
+  }).description('官方数据源').default({}),
+  whale: z.object({
+    enabled: z.boolean().default(true).description('读取小鲸鱼账本'),
+    path: z.string().default('').description('账本路径(空=默认 ~/.dsh/.dshw-usage.json)'),
+  }).description('小鲸鱼账本').default({}),
+  sampling: z.object({
+    netGpuSeconds: z.number().min(1).max(30).default(2).description('网络/GPU 采样间隔(秒)'),
+    diskSeconds: z.number().min(2).max(120).default(5).description('磁盘采样间隔(秒)'),
+    dshsizeMinutes: z.number().min(1).max(120).default(5).description('DSH 占用重算间隔(分钟)'),
+  }).description('采样节奏').default({}),
+});
+
+export function apply(ctx, config = {}) {
   const logger = ctx.logger ?? console;
+  const cfg = config && typeof config === 'object' ? config : {};
+
+  /* ---- config → pricing: merge models.default / models.overrides JSON
+   *      into the effective PRICING table (bad JSON → warn + built-in). ---- */
+  function parsePriceEntry(value) {
+    if (!value || typeof value !== 'object') return null;
+    const input = Number(value.input);
+    const cachedInput = Number(value.cachedInput);
+    const output = Number(value.output);
+    if (!Number.isFinite(input) || !Number.isFinite(cachedInput) || !Number.isFinite(output)) return null;
+    return { input, cachedInput, output };
+  }
+  (function applyPricingConfig() {
+    const pricing = cfg.pricing;
+    if (pricing && typeof pricing === 'object') {
+      const ratio = Number(pricing.offPeakRatio);
+      if (Number.isFinite(ratio) && ratio >= 0 && ratio <= 1) OFF_PEAK_RATIO = ratio;
+    }
+    const effective = { ...BUILTIN_PRICING };
+    const models = pricing && typeof pricing === 'object' ? pricing.models : null;
+    if (models && typeof models === 'object') {
+      if (typeof models.default === 'string' && models.default.trim() !== '') {
+        try {
+          const entry = parsePriceEntry(JSON.parse(models.default));
+          if (entry) effective.default = entry;
+        } catch (error) {
+          logger.warn(`dsh-resmon: invalid pricing.models.default JSON, keeping built-in: ${String(error?.message ?? error)}`);
+        }
+      }
+      if (typeof models.overrides === 'string' && models.overrides.trim() !== '') {
+        try {
+          const overrides = JSON.parse(models.overrides);
+          if (overrides && typeof overrides === 'object' && !Array.isArray(overrides)) {
+            for (const [modelId, value] of Object.entries(overrides)) {
+              const entry = parsePriceEntry(value);
+              if (entry) effective[modelId] = entry;
+            }
+          }
+        } catch (error) {
+          logger.warn(`dsh-resmon: invalid pricing.models.overrides JSON, keeping built-in: ${String(error?.message ?? error)}`);
+        }
+      }
+    }
+    PRICING = effective;
+  })();
+
+  /* ---- config → sampling cadences (seconds/minutes → 1 s ticks). ---- */
+  const sampling = cfg.sampling;
+  let netGpuEveryTicks = 2;
+  let diskEveryTicks = 5;
+  let dshsizeEveryTicks = 300;
+  if (sampling && typeof sampling === 'object') {
+    const n = Number(sampling.netGpuSeconds);
+    if (Number.isFinite(n) && n >= 1) netGpuEveryTicks = Math.max(1, Math.round(n));
+    const d = Number(sampling.diskSeconds);
+    if (Number.isFinite(d) && d >= 2) diskEveryTicks = Math.max(2, Math.round(d));
+    const m = Number(sampling.dshsizeMinutes);
+    if (Number.isFinite(m) && m >= 1) dshsizeEveryTicks = Math.max(60, Math.round(m * 60));
+  }
+
+  /* ---- config → official data source. ---- */
+  const officialCfg = cfg.official;
+  const officialMode = officialCfg && typeof officialCfg === 'object' &&
+    ['auto', 'apikey', 'account', 'off'].includes(officialCfg.mode) ? officialCfg.mode : 'auto';
+  const officialPollSeconds = officialCfg && typeof officialCfg === 'object' ? Number(officialCfg.pollSeconds) : NaN;
+  const officialPollMs = Number.isFinite(officialPollSeconds) && officialPollSeconds >= 15 && officialPollSeconds <= 600
+    ? Math.round(officialPollSeconds * 1000) : OFFICIAL_BALANCE_INTERVAL_MS;
+
+  /* ---- config → whale ledger. ---- */
+  const whaleCfg = cfg.whale;
+  const whaleEnabled = !whaleCfg || typeof whaleCfg !== 'object' || whaleCfg.enabled !== false;
+  const whalePath = whaleCfg && typeof whaleCfg === 'object' && typeof whaleCfg.path === 'string'
+    ? whaleCfg.path.trim() : '';
 
   /* ------------------------------------------------------------------ *
    * 1. CPU / memory / disk / network / GPU sampling                     *
@@ -962,13 +1108,13 @@ export function apply(ctx) {
       dshHistory.cpu.shift();
       dshHistory.mem.shift();
     }
-    // Sub-sampling cadences driven by the same 1-second tick.
-    if (tick % NET_GPU_EVERY_TICKS === 0) {
+    // Sub-sampling cadences driven by the same 1-second tick (configurable).
+    if (tick % netGpuEveryTicks === 0) {
       sampleWindowsCounters(); // merged: net + disk active (+ generic GPU counters)
       sampleGpu();             // nvidia-smi only, when that backend is active
     }
-    if (tick % DISK_EVERY_TICKS === 0) sampleDisk();
-    if (tick % DISK_REPROBE_EVERY_TICKS === 0) {
+    if (tick % diskEveryTicks === 0) sampleDisk();
+    if (tick % dshsizeEveryTicks === 0) {
       probeDrives();
       computeDshSize().catch(() => {});
     }
@@ -1311,6 +1457,7 @@ export function apply(ctx) {
   let apiKeyRejected = null; // a key the official API rejected (401/403)
   let officialBusy = false;
   let whaleToday = null; // today usage from the whale ledger, when readable (CNY)
+  let whaleCumulative = null; // all-days usage from the whale ledger (CNY)
 
   function sha16(value) {
     return createHash('sha256').update(value).digest('hex').slice(0, 16);
@@ -1354,34 +1501,58 @@ export function apply(ctx) {
     officialState.lastBalance = total;
   }
 
-  /** Read the whale widget ledger (~/.dsh/.dshw-usage.json) defensively.
-   *  A missing/unreadable/corrupt file or an unextractable value clears
-   *  whaleToday (the delta logic then takes over); only a successfully
-   *  parsed number survives. Debug-level logging only. */
+  /** Read the whale widget ledger defensively (configurable path; disabled
+   *  by Config.whale.enabled). A missing/unreadable/corrupt file or an
+   *  unextractable value clears both figures (the delta logic then takes
+   *  over for today); only successfully parsed numbers survive.
+   *  Debug-level logging only. */
   async function sampleWhaleLedger() {
+    if (!whaleEnabled) {
+      whaleToday = null;
+      whaleCumulative = null;
+      return;
+    }
     try {
       const home = homeDir();
-      if (!home) { whaleToday = null; return; }
-      const raw = await readFile(join(home, '.dshw-usage.json'), 'utf8');
+      const ledgerPath = whalePath !== '' ? whalePath : (home ? join(home, '.dshw-usage.json') : null);
+      if (!ledgerPath) {
+        whaleToday = null;
+        whaleCumulative = null;
+        return;
+      }
+      const raw = await readFile(ledgerPath, 'utf8');
       let ledger = null;
       try { ledger = JSON.parse(raw); } catch { ledger = null; }
-      const value = whaleTodayOf(ledger, beijingDayKey());
-      whaleToday = value;
-      logger.debug?.(`dsh-resmon: whale ledger read: ${value === null ? 'no usable value' : 'todayUsed ' + value}`);
+      whaleToday = whaleTodayOf(ledger, beijingDayKey());
+      whaleCumulative = whaleCumulativeOf(ledger);
+      logger.debug?.(`dsh-resmon: whale ledger read: today=${whaleToday === null ? 'null' : whaleToday} cumulative=${whaleCumulative === null ? 'null' : whaleCumulative}`);
     } catch (error) {
       whaleToday = null;
+      whaleCumulative = null;
       logger.debug?.(`dsh-resmon: whale ledger read failed: ${String(error?.message ?? error)}`);
     }
   }
 
-  /** Probe the data source: API key first, then the logged-in account.
-   *  Only plausible DeepSeek key strings (sk-…) select the apikey source —
-   *  the local credential store can hold a placeholder UUID that must not
-   *  hijack apikey mode (observed on this machine). */
+  /** Probe the data source: API key first, then the logged-in account
+   *  (Config.official.mode restricts the paths: 'apikey'/'account' force one,
+   *  'off' disables both). Only plausible DeepSeek key strings (sk-…) select
+   *  the apikey source — the local credential store can hold a placeholder
+   *  UUID that must not hijack apikey mode (observed on this machine). */
   async function probeOfficialSource() {
+    if (officialMode === 'off') {
+      if (officialState.source !== null) resetOfficialBaseline(null, '');
+      officialSource = null;
+      officialLive.balance = null;
+      officialLive.updatedAt = null;
+      officialLive.balanceError = false;
+      officialLive.todayCost = null; // tier-2 is account-only
+      officialLive.todayCostDay = null;
+      officialLive.monthCost = null;
+      return null;
+    }
     const credentials = ctx.get('credentials');
     let key = null;
-    if (credentials && typeof credentials.resolve === 'function') {
+    if (officialMode !== 'account' && credentials && typeof credentials.resolve === 'function') {
       try {
         const resolved = await credentials.resolve('DEEPSEEK_API_KEY');
         if (resolved && typeof resolved.value === 'string') {
@@ -1399,18 +1570,20 @@ export function apply(ctx) {
       officialSource = 'apikey';
       return 'apikey';
     }
-    const account = ctx.get('deepseekAccount');
-    if (account && typeof account.getState === 'function' && typeof account.getBalance === 'function') {
-      try {
-        const state = await account.getState();
-        if (state && state.status === 'credential-stored') {
-          const usageUrl = state.links && typeof state.links.usageUrl === 'string' ? state.links.usageUrl : null;
-          officialLive.usageUrl = usageUrl;
-          if (officialSource !== 'account') resetOfficialBaseline('account', 'account:cny');
-          officialSource = 'account';
-          return 'account';
-        }
-      } catch { /* tolerant */ }
+    if (officialMode !== 'apikey') {
+      const account = ctx.get('deepseekAccount');
+      if (account && typeof account.getState === 'function' && typeof account.getBalance === 'function') {
+        try {
+          const state = await account.getState();
+          if (state && state.status === 'credential-stored') {
+            const usageUrl = state.links && typeof state.links.usageUrl === 'string' ? state.links.usageUrl : null;
+            officialLive.usageUrl = usageUrl;
+            if (officialSource !== 'account') resetOfficialBaseline('account', 'account:cny');
+            officialSource = 'account';
+            return 'account';
+          }
+        } catch { /* tolerant */ }
+      }
     }
     // Neither source available: everything official goes null.
     if (officialState.source !== null) resetOfficialBaseline(null, '');
@@ -1715,7 +1888,7 @@ export function apply(ctx) {
     sampleOfficialBalance().catch(() => {}); // first official probe + snapshot
     const persistTimer = setInterval(persist, PERSIST_INTERVAL_MS);
     const backfillTimer = setInterval(() => { scanSessionStore().catch(() => {}); }, BACKFILL_INTERVAL_MS);
-    const officialTimer = setInterval(() => { sampleOfficialBalance().catch(() => {}); }, OFFICIAL_BALANCE_INTERVAL_MS);
+    const officialTimer = setInterval(() => { sampleOfficialBalance().catch(() => {}); }, officialPollMs);
     ctx.effect(() => () => {
       clearInterval(persistTimer);
       clearInterval(backfillTimer);
@@ -1871,6 +2044,7 @@ export function apply(ctx) {
         todayUsed: officialState.source !== null && officialState.lastBalance !== null ? round2(officialState.todayUsed) : null,
         needsReview: officialState.needsReview,
         whaleToday: whaleToday !== null ? round2(whaleToday) : null,
+        whaleCumulative: whaleCumulative !== null ? round2(whaleCumulative) : null,
         todayCost: officialLive.todayCost !== null ? round2(officialLive.todayCost) : null,
         monthCost: officialLive.monthCost !== null ? round2(officialLive.monthCost) : null,
         usageUrl: officialLive.usageUrl,
